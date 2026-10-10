@@ -23,14 +23,21 @@ class Agent:
     def __init__(self) -> None:
         self._bot: RedAlertBot | None = None
 
-    def _red_alert(self) -> RedAlertBot:
+    def _red_alert(self, context: DecisionContext) -> RedAlertBot:
         if self._bot is None:
-            self._bot = RedAlertBot(advisor=commanders_from_env(), dump_dir=dump_dir_from_env())
+            # Tag every line with the match and seat: several games share one console.
+            tag = f"{str(context.session_id or '')[:4]}/seat{context.seat_position}"
+
+            def log(message: str) -> None:
+                print(f"[{tag}] {message}", flush=True)
+
+            self._bot = RedAlertBot(advisor=commanders_from_env(log=log, seat=context.seat_position), log=log,
+                                    dump_dir=dump_dir_from_env())
         return self._bot
 
     def choose_action(self, state: GameState, context: DecisionContext):
         if (context.game_type or state.game_name) == "red_alert":
-            return self._red_alert().choose_action(state, context)
+            return self._red_alert(context).choose_action(state, context)
         return state.legal_actions[0] if state.legal_actions else WAIT
 
     def on_action_result(self, result: dict, context: DecisionContext) -> None:

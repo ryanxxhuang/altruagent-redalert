@@ -30,3 +30,4 @@ htmlcov/
 .idea/
 .DS_Store
 logs/
+logs-*.txt

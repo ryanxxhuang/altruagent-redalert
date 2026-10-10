@@ -80,16 +80,21 @@ def test_defends_base():
         visible_enemies=[{"id": 900, "type": "1tnk", "x": 22, "y": 23, "hp": 100}],
     )
     orders = _orders(bot().choose_action(_state(obs), CTX))
-    attack = [o for o in orders if o["cmd"] == "attack_move"]
-    assert attack and attack[0]["to"] == [22, 23] and len(attack[0]["units"]) == 3
+    # All three engage the intruder: attack-move to it, or focus fire on it.
+    engaged = set()
+    for o in orders:
+        if (o["cmd"] == "attack_move" and o["to"] == [22, 23]) or (o["cmd"] == "attack" and o["target"] == 900):
+            engaged |= set(o["units"])
+    assert engaged == {100, 101, 102}
 
 
 def test_attacks_with_big_army_and_respects_command_cap():
-    army = [{"id": 100 + i, "type": "e1", "x": 25, "y": 25, "idle": True} for i in range(120)]
+    army = [{"id": 100 + i, "type": "3tnk", "x": 25, "y": 25, "idle": True} for i in range(120)]
     obs = _obs(buildings=[{"id": 1, "type": "fact", "x": 20, "y": 20}], units=army)
     orders = _orders(bot().choose_action(_state(obs), CTX))
     attack = [o for o in orders if o["cmd"] == "attack_move"]
-    assert attack and attack[0]["to"] == [80, 80]
+    # The group steps towards the enemy base (80, 80) together.
+    assert attack and attack[0]["to"][0] > 25 and attack[0]["to"][1] > 25
     assert sum(len(o.get("units") or []) or o.get("count", 1) for o in orders) <= 200
     assert all(len(o["units"]) <= 50 for o in attack)
 
@@ -111,7 +116,7 @@ class FakeCommanders:
     def __init__(self, knobs=None, commands=None):
         self._knobs, self._commands = knobs or {}, commands or []
 
-    def observe(self, raw):
+    def observe(self, raw, status=None):
         pass
 
     def knobs(self):
@@ -130,15 +135,23 @@ def _army_obs(n, enemies=()):
 def test_tactical_attack_now_and_target():
     b = RedAlertBot(log=lambda m: None, advisor=FakeCommanders({"target": (70, 30)}, [{"type": "attack_now"}]))
     orders = _orders(b.choose_action(_state(_army_obs(5)), CTX))
-    assert any(o["cmd"] == "attack_move" and o["to"] == [70, 30] for o in orders)
+    # Heads for the chosen target (70, 30) from (50, 50): east and north.
+    assert any(o["cmd"] == "attack_move" and o["to"][0] > 50 and o["to"][1] < 50 for o in orders)
 
 
-def test_tactical_retreat():
+def test_tactical_retreat_only_when_losing():
     b = RedAlertBot(log=lambda m: None)
     b.choose_action(_state(_army_obs(12)), CTX)
     assert b._attacking
+    # Winning (no enemies near): the retreat is ignored.
     b.advisor = FakeCommanders(commands=[{"type": "retreat"}])
-    orders = _orders(b.choose_action(_state(_army_obs(12)), CTX))
+    b.choose_action(_state(_army_obs(12)), CTX)
+    assert b._attacking
+    # Losing to a pile of enemy heavy tanks: the retreat goes through.
+    foes = [{"id": 900 + i, "type": "4tnk", "x": 54, "y": 50, "hp": 100} for i in range(15)]
+    b.advisor = FakeCommanders(commands=[{"type": "retreat"}])
+    b._rush_active = False
+    orders = _orders(b.choose_action(_state(_army_obs(12, foes)), CTX))
     assert not b._attacking and any(o["cmd"] == "move" for o in orders)
 
 
@@ -156,20 +169,29 @@ def test_fast_focus_fire_and_pull_back():
 def test_layer_settings_and_handlers(monkeypatch):
     from agent import advisor
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
-    monkeypatch.delenv("FAST_MODEL", raising=False)
+    for var in ("STRATEGY_MODEL", "TACTICAL_MODEL", "FAST_MODEL", "TACTICAL_EVERY"):
+        monkeypatch.delenv(var, raising=False)
     c = advisor.commanders_from_env(log=lambda m: None)
-    assert c._layers["strategy"].model == "claude-fable-5-1" and c._layers["strategy"].effort == "medium"
-    assert c._layers["tactical"].model == "claude-opus-5-5" and c._layers["tactical"].effort == "low"
-    assert "fast" not in c._layers
-    sonnet = advisor.Layer("fast", None, "claude-sonnet-5-5", "low", 4, 15, 10, "", {}, print)
-    assert sonnet._request_kwargs()["thinking"] == {"type": "between_tools"}
-    assert "thinking" not in c._layers["strategy"]._request_kwargs()
-    c._on_strategy({"posture": "aggressive", "unit_focus": "tanks", "defenses": 9, "max_refineries": 2, "plan": "rush"})
-    c._on_tactical({"attack_size": 2, "action": "retreat", "target_x": -1, "target_y": -1, "note": "x"})
+    layers = c._layers
+    assert (layers["strategy"].model, layers["strategy"].effort) == ("claude-opus-5-5", "medium")
+    assert (layers["tactical"].model, layers["tactical"].effort, layers["tactical"].every) == ("claude-sonnet-5-5", "low", 3.0)
+    assert (layers["fast"].model, layers["fast"].effort) == ("claude-haiku-5-5", "low")
+    fast = layers["fast"]._request_kwargs()
+    assert fast["thinking"] == {"type": "disabled"} and "fallbacks" not in fast  # Haiku: no server fallback
+    assert "thinking" not in layers["tactical"]._request_kwargs()
+    assert layers["strategy"]._request_kwargs()["fallbacks"] == "default"
+    c._on_strategy({"posture": "aggressive", "unit_focus": "tanks", "defenses": 9, "max_refineries": 2,
+                    "build_targets": [{"item": "PROC", "count": 2}], "avoid": ["fix"], "plan": "rush"})
     k = c.knobs()
-    assert k["posture"] == "aggressive" and k["defenses"] == 6 and k["attack_size"] == 4 and k["target"] is None
-    assert c.pop_commands() == [{"type": "retreat"}]
-
+    assert k["posture"] == "aggressive" and k["defenses"] == 6
+    assert k["build_targets"] == [("proc", 2)] and k["avoid"] == ["fix"]
+    c._on_tactical({"build": "WEAP", "defense": "", "infantry": "e3", "infantry_count": 9, "vehicle": "auto",
+                    "vehicle_count": 1, "main_action": "attack", "main_x": 70, "main_y": 40, "raid_size": 3,
+                    "raid_x": -1, "raid_y": -1, "note": "go"})
+    d = c.decision()
+    assert d["build"] == "weap" and d["infantry_count"] == 5 and d["main_action"] == "attack" and d["seq"] == 1
+    monkeypatch.setenv("TACTICAL_EVERY", "6")
+    assert advisor.commanders_from_env(log=lambda m: None)._layers["tactical"].every == 6.0
 
 def test_rule_micro_focuses_weak_valuable_target_and_pulls_back():
     army = [{"id": 100 + i, "type": "3tnk", "x": 50, "y": 50, "idle": False, "hp": 100} for i in range(3)]
@@ -183,3 +205,451 @@ def test_rule_micro_focuses_weak_valuable_target_and_pulls_back():
     focus = [o for o in orders if o["cmd"] == "attack"]
     assert focus and focus[-1]["target"] == 901 and 200 not in focus[-1]["units"]
     assert any(o["cmd"] == "move" and o["units"] == [200] for o in orders)
+
+
+def test_no_infantry_only_wave_in_opening_for_macro(monkeypatch):
+    monkeypatch.setenv("REDALERT_OPENING", "macro")
+    army = [{"id": 100 + i, "type": "e1", "x": 25, "y": 25, "idle": True} for i in range(10)]
+    obs = _obs(buildings=[{"id": 1, "type": "fact", "x": 20, "y": 20}], units=army)
+    b = bot()
+    b.choose_action(_state(obs), CTX)
+    assert not b._attacking
+
+
+def test_rush_launches_with_eight_infantry_and_delays_war_factory():
+    b = bot()
+    obs = _obs(buildings=[{"id": 1, "type": "fact", "x": 20, "y": 20}, {"id": 2, "type": "powr", "x": 22, "y": 20},
+                          {"id": 3, "type": "barr", "x": 24, "y": 20}, {"id": 4, "type": "proc", "x": 26, "y": 20}],
+               available_production=["weap", "powr", "e1", "e3"])
+    obs["economy"].update(power_provided=100, power_drained=50)
+    orders = _orders(b.choose_action(_state(obs), CTX))
+    assert {"cmd": "build", "item": "weap"} not in orders  # money goes to the rush first
+    obs["units"] = [{"id": 100 + i, "type": "e1", "x": 25, "y": 25, "idle": True} for i in range(8)]
+    b.choose_action(_state(obs), CTX)
+    assert b._attacking and b._rush_launched
+
+
+def test_raid_hunts_enemy_ore_field(monkeypatch):
+    monkeypatch.setenv("REDALERT_OPENING", "macro")
+    b = bot()
+    army = [{"id": 100 + i, "type": "3tnk", "x": 27, "y": 27, "idle": True} for i in range(7)]
+    st = _state(_obs(buildings=[{"id": 1, "type": "fact", "x": 20, "y": 20}], units=army))
+    ctx = DecisionContext(session_id="s", tournament_id=None, game_type="red_alert", agent_id="a", game_config={
+        "rules": {"maps": {"sidestep": {"spawns": [[20, 20], [80, 80]], "layout": {
+            "origin": [0, 0], "rows": ["." * 100] * 70 + ["." * 70 + "$$$$" + "." * 26] * 4 + ["." * 100] * 26}}}}})
+    b.knobs["attack_size"] = 20
+    orders = _orders(b.choose_action(st, ctx))
+    raid = [o for o in orders if o["cmd"] in ("move", "attack_move") and len(o["units"]) == 4]
+    assert raid and 70 <= raid[0]["to"][0] <= 73 and 70 <= raid[0]["to"][1] <= 73
+
+
+def _kite_state(enemy_x_seq):
+    """A light tank (fast) chased by a heavy tank (slow); returns orders per step."""
+    b = bot()
+    b._rush_active = False
+    out = []
+    for ex in enemy_x_seq:
+        army = [{"id": 100, "type": "1tnk", "x": 50, "y": 50, "idle": False, "hp": 100}]
+        foe = [{"id": 900, "type": "3tnk", "x": ex, "y": 50, "hp": 100}]
+        obs = _obs(buildings=[{"id": 1, "type": "fact", "x": 20, "y": 50}], units=army, visible_enemies=foe,
+                   base_center=[20, 50])
+        d = b.choose_action(_state(obs), CTX)
+        out.append(d.action["orders"] if isinstance(d, WithReasoning) else [])
+    return out
+
+
+def test_kiting_runs_from_a_chasing_enemy():
+    steps = _kite_state([57, 55])  # heavy tank closing in from the east
+    run = [o for o in steps[-1] if o["cmd"] == "move" and 100 in o["units"]]
+    assert run and run[0]["to"][0] < 50  # runs west, away from it
+
+
+def test_kiting_turns_and_shoots_when_the_enemy_turns_back():
+    b_steps = _kite_state([55, 58])  # it was close, now it is moving away
+    shoot = [o for o in b_steps[-1] if o["cmd"] == "attack" and 100 in o["units"]]
+    assert shoot and shoot[0]["target"] == 900
+
+
+def test_no_kiting_when_the_enemy_is_faster_and_outranges():
+    from agent.redalert_bot import RedAlertBot as B
+    b = B(log=lambda m: None)
+    assert not b._can_kite({"type": "e1"}, {"type": "1tnk"})
+    assert b._can_kite({"type": "1tnk"}, {"type": "3tnk"})
+    assert b._can_kite({"type": "v2rl"}, {"type": "3tnk"})
+
+
+def test_weapon_range_parsing():
+    from agent.redalert_bot import _weapon_range
+    assert _weapon_range({"weapon": {"name": "105mm", "range": "4c768"}}) == 4.75
+    assert _weapon_range({"weapon": [{"range": 5}, {"range": 7.5}]}) == 7.5
+    assert _weapon_range({"weapon": "105mm"}) is None
+
+
+def test_kiting_trades_shots_with_a_stationary_enemy():
+    steps = _kite_state([54, 54])  # in range, not moving: shoot it (once; it keeps shooting)
+    assert any(o["cmd"] == "attack" and o["target"] == 900 for o in steps[0])
+    assert not any(o["cmd"] == "move" and 100 in o["units"] for step in steps for o in step)
+
+
+def test_anti_air_main_weapon_falls_back_to_ground_range():
+    from agent.redalert_bot import _weapon_range
+    assert _weapon_range({"weapon": {"weapon": "RedEye", "range_cells": 7.5}}) is None
+    assert _weapon_range({"weapon": {"weapon": "FLAK-23-AA", "range_cells": 8.0}}) is None
+    assert _weapon_range({"weapon": {"weapon": "105mm", "range_cells": 4.75}}) == 4.75
+    b = bot()
+    b.rules = {"e3": {"weapon": {"weapon": "RedEye", "range_cells": 7.5}, "speed": 1.32},
+               "3tnk": {"weapon": {"weapon": "105mm", "range_cells": 4.75}, "speed": 1.56}}
+    assert b._range({"type": "e3"}) == 5.0
+    assert not b._can_kite({"type": "e3"}, {"type": "3tnk"})
+
+
+def test_many_beat_few_attacks_after_wiping_their_army(monkeypatch):
+    monkeypatch.setenv("REDALERT_OPENING", "macro")
+    b = bot()
+    mine = [{"id": 100 + i, "type": "e1", "x": 50, "y": 50, "idle": True, "hp": 100} for i in range(3)]
+    foes = [{"id": 900 + i, "type": "e1", "x": 52, "y": 50, "hp": 100} for i in range(4)]  # 400 vs our 300
+    b.choose_action(_state(_obs(buildings=[{"id": 1, "type": "fact", "x": 20, "y": 20}], units=mine,
+                                visible_enemies=foes)), CTX)
+    assert not b._attacking
+    # They died where we could see: their known army is gone, our 3 riflemen go.
+    b.choose_action(_state(_obs(buildings=[{"id": 1, "type": "fact", "x": 20, "y": 20}], units=mine)), CTX)
+    assert b._attacking
+
+
+def test_no_full_wave_into_a_stronger_known_army(monkeypatch):
+    monkeypatch.setenv("REDALERT_OPENING", "macro")
+    b = bot()
+    b.knobs["attack_size"] = 6
+    mine = [{"id": 100 + i, "type": "3tnk", "x": 30, "y": 30, "idle": True, "hp": 100} for i in range(8)]
+    seen = [{"id": 900 + i, "type": "4tnk", "x": 70, "y": 70, "hp": 100} for i in range(10)]
+    obs = _obs(buildings=[{"id": 1, "type": "fact", "x": 20, "y": 20}], units=mine, visible_enemies=seen)
+    b.choose_action(_state(obs), CTX)
+    assert not b._attacking
+
+
+def test_group_waits_for_stragglers_and_holds_when_outnumbered_ahead(monkeypatch):
+    monkeypatch.setenv("REDALERT_OPENING", "macro")
+    b = bot()
+    b._attacking = True
+    b._wave_peak = 10
+    front = [{"id": 100 + i, "type": "3tnk", "x": 50, "y": 50, "idle": True, "hp": 100} for i in range(6)]
+    back = [{"id": 200 + i, "type": "3tnk", "x": 39, "y": 39, "idle": False, "hp": 100} for i in range(4)]
+    obs = _obs(buildings=[{"id": 1, "type": "fact", "x": 20, "y": 20}], units=front + back)
+    orders = _orders(b.choose_action(_state(obs), CTX))
+    moves = [(tuple(o["to"]), set(o["units"])) for o in orders if o["cmd"] == "attack_move"]
+    # Stragglers head to the group; nobody pushes past it towards (80, 80).
+    assert any({200, 201, 202, 203} <= ids for _, ids in moves)
+    assert all(to[0] <= 51 and to[1] <= 51 for to, _ in moves)
+    # Grouped up, a stronger enemy force sits ahead but out of contact: hold.
+    b2 = bot()
+    b2._attacking, b2._wave_peak = True, 6
+    foes = [{"id": 900 + i, "type": "4tnk", "x": 62, "y": 62, "hp": 100} for i in range(8)]
+    obs = _obs(buildings=[{"id": 1, "type": "fact", "x": 20, "y": 20}], units=front, visible_enemies=foes)
+    orders = _orders(b2.choose_action(_state(obs), CTX))
+    assert all(o["to"] == [50, 50] for o in orders if o["cmd"] == "attack_move")
+    # Already in contact with it: never stand still at our own centre.
+    foes = [{"id": 900 + i, "type": "4tnk", "x": 56, "y": 56, "hp": 100} for i in range(8)]
+    b2._sent.clear()
+    obs = _obs(buildings=[{"id": 1, "type": "fact", "x": 20, "y": 20}], units=front, visible_enemies=foes)
+    orders = _orders(b2.choose_action(_state(obs), CTX))
+    assert not any(o["cmd"] == "attack_move" and o["to"] == [50, 50] for o in orders)
+
+
+def test_strategy_build_targets_and_avoid_are_obeyed():
+    b = bot()
+    b.knobs.update(build_targets=[("proc", 2), ("harv", 3)], avoid=["fix"])
+    obs = _obs(buildings=[{"id": 1, "type": "fact", "x": 20, "y": 20}, {"id": 2, "type": "powr", "x": 22, "y": 20},
+                          {"id": 3, "type": "barr", "x": 24, "y": 20}, {"id": 4, "type": "proc", "x": 26, "y": 20},
+                          {"id": 5, "type": "weap", "x": 28, "y": 20}],
+               units=[{"id": 50, "type": "harv", "x": 30, "y": 30}],
+               available_production=["powr", "proc", "fix", "harv", "3tnk", "e1"])
+    obs["economy"].update(power_provided=200, power_drained=100)
+    orders = _orders(b.choose_action(_state(obs), CTX))
+    assert {"cmd": "build", "item": "proc"} in orders
+    assert any(o["cmd"] == "train" and o["item"] == "harv" for o in orders)
+    assert {"cmd": "build", "item": "fix"} not in orders
+
+
+class FakeCommander(FakeCommanders):
+    def __init__(self, decision):
+        super().__init__()
+        import time as _t
+        self._d = {"seq": 1, "t": _t.monotonic(), "build": "auto", "defense": "auto", "infantry": "auto",
+                   "infantry_count": 2, "vehicle": "auto", "vehicle_count": 1, "main_action": "hold",
+                   "main_x": -1, "main_y": -1, "raid_size": 0, "raid_unit": "", "raid_x": -1, "raid_y": -1, **decision}
+
+    def decision(self):
+        return dict(self._d)
+
+
+def _base_obs(units=(), **kw):
+    obs = _obs(buildings=[{"id": 1, "type": "fact", "x": 20, "y": 20}, {"id": 2, "type": "powr", "x": 22, "y": 20},
+                          {"id": 3, "type": "barr", "x": 24, "y": 20}, {"id": 4, "type": "proc", "x": 26, "y": 20},
+                          {"id": 5, "type": "weap", "x": 28, "y": 20}],
+               units=[{"id": 50, "type": "harv", "x": 30, "y": 30}, *units],
+               available_production=["powr", "proc", "fix", "dome", "ftur", "harv", "3tnk", "e1", "e3"], **kw)
+    obs["economy"].update(power_provided=200, power_drained=100)
+    return obs
+
+
+def test_commander_production_is_obeyed_once_per_decision():
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander(
+        {"build": "dome", "defense": "ftur", "infantry": "e3", "infantry_count": 3, "vehicle": "3tnk", "vehicle_count": 2}))
+    orders = _orders(b.choose_action(_state(_base_obs()), CTX))
+    assert {"cmd": "build", "item": "dome"} in orders
+    assert {"cmd": "build", "item": "ftur"} in orders
+    assert {"cmd": "train", "item": "e3", "count": 3} in orders
+    assert {"cmd": "train", "item": "3tnk", "count": 2} in orders
+    b._sent.clear()
+    again = b.choose_action(_state(_base_obs()), CTX)
+    again = again.action["orders"] if isinstance(again, WithReasoning) else []
+    assert {"cmd": "build", "item": "dome"} not in again  # one building per decision, not one per tick
+
+
+def test_commander_unknown_item_is_reported_back():
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"build": "stek"}))
+    b.choose_action(_state(_base_obs()), CTX)
+    assert any("stek" in p for p in b.status()["problems"])
+
+
+def test_commander_attack_retreat_and_raid():
+    army = [{"id": 100 + i, "type": "3tnk", "x": 30, "y": 30, "idle": True, "hp": 100} for i in range(6)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 70, "main_y": 70,
+                                                                "raid_size": 2, "raid_x": 60, "raid_y": 20}))
+    orders = _orders(b.choose_action(_state(_base_obs(units=army)), CTX))
+    assert b._attacking and len(b._raiders) == 2
+    assert any(o["cmd"] in ("move", "attack_move") and o["to"] == [60, 20] and set(o["units"]) == b._raiders for o in orders)
+    assert any(o["cmd"] == "attack_move" and o["to"][0] > 30 and not set(o["units"]) & b._raiders for o in orders)
+    b.advisor = FakeCommander({"main_action": "retreat", "raid_size": 0})
+    b._sent.clear()
+    orders = _orders(b.choose_action(_state(_base_obs(units=army)), CTX))
+    assert not b._attacking and any(o["cmd"] == "move" for o in orders)
+
+
+def test_stale_commander_falls_back_to_rules():
+    import time as _t
+    fake = FakeCommander({"build": "dome"})
+    fake._d["t"] = _t.monotonic() - 60
+    b = RedAlertBot(log=lambda m: None, advisor=fake)
+    orders = _orders(b.choose_action(_state(_base_obs()), CTX))
+    assert {"cmd": "build", "item": "dome"} not in orders  # the rules' own build order instead
+    assert any(o["cmd"] == "build" for o in orders)
+
+
+def test_avoid_never_blocks_a_prerequisite_of_a_wanted_unit():
+    b = bot()
+    b.rules = {"3tnk": {"prerequisites": ["fix"], "queue": "Vehicle"}, "fix": {"queue": "Building"}}
+    b.knobs.update(build_targets=[("3tnk", 8)], avoid=["fix", "dome"])
+    assert b._avoid() == {"dome"}
+
+
+def test_per_seat_models_and_cost_report(monkeypatch):
+    from types import SimpleNamespace
+    from agent import advisor
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    monkeypatch.setenv("TACTICAL_MODEL", "seat0:claude-sonnet-5-5,seat1:claude-haiku-5-5")
+    monkeypatch.setenv("STRATEGY_EVERY", "seat0:15,seat1:30")
+    a = advisor.commanders_from_env(log=lambda m: None, seat=0)
+    b = advisor.commanders_from_env(log=lambda m: None, seat=1)
+    assert a._layers["tactical"].model == "claude-sonnet-5-5" and a._layers["strategy"].every == 15.0
+    assert b._layers["tactical"].model == "claude-haiku-5-5" and b._layers["strategy"].every == 30.0
+    layer = b._layers["tactical"]
+    layer._count(SimpleNamespace(usage=SimpleNamespace(input_tokens=1_000_000, output_tokens=200_000)), 2.0)
+    assert abs(layer.cost() - 0.20) < 1e-9  # Haiku: $0.10/M in + $0.50/M out
+    assert "$0.20" in b.cost_report()
+
+
+def test_commander_repeat_before_seeing_the_start_is_not_a_second_copy():
+    import time as _t
+    fake = FakeCommander({"build": "dome", "seq": 1})
+    b = RedAlertBot(log=lambda m: None, advisor=fake)
+    assert {"cmd": "build", "item": "dome"} in _orders(b.choose_action(_state(_base_obs()), CTX))
+    # Next decision, asked before the dome started, says "dome" again: ignored.
+    fake._d.update(seq=2, asked_at=_t.monotonic() - 2, t=_t.monotonic())
+    b._sent.clear()
+    d = b.choose_action(_state(_base_obs()), CTX)
+    assert {"cmd": "build", "item": "dome"} not in (d.action["orders"] if isinstance(d, WithReasoning) else [])
+    # A later decision that saw it start and still wants one: a second dome.
+    fake._d.update(seq=3, asked_at=_t.monotonic() + 5, t=_t.monotonic())
+    b._sent.clear()
+    assert {"cmd": "build", "item": "dome"} in _orders(b.choose_action(_state(_base_obs()), CTX))
+
+
+def test_general_targets_fill_the_gap_between_commander_orders():
+    fake = FakeCommander({"build": "dome", "seq": 1})
+    b = RedAlertBot(log=lambda m: None, advisor=fake)
+    b.knobs["build_targets"] = [("proc", 2)]
+    b.choose_action(_state(_base_obs()), CTX)  # dome done for decision 1
+    b._sent.clear()
+    assert {"cmd": "build", "item": "proc"} in _orders(b.choose_action(_state(_base_obs()), CTX))
+
+
+def test_holding_is_reported_not_overridden():
+    army = [{"id": 100 + i, "type": "3tnk", "x": 26, "y": 26, "idle": True, "hp": 100} for i in range(8)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "hold"}))
+    b.choose_action(_state(_base_obs(units=army)), CTX)
+    b._holding_since -= 41
+    b.choose_action(_state(_base_obs(units=army)), CTX)
+    assert not b._attacking and b.status()["main_idle_seconds"] >= 41  # the LLM decides, with the facts
+
+
+def test_commander_attack_advances_into_a_stronger_force_and_reports_it():
+    front = [{"id": 100 + i, "type": "3tnk", "x": 50, "y": 50, "idle": True, "hp": 100} for i in range(6)]
+    foes = [{"id": 900 + i, "type": "4tnk", "x": 57, "y": 57, "hp": 100} for i in range(5)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 80}))
+    orders = _orders(b.choose_action(_state(_base_obs(units=front, visible_enemies=foes)), CTX))
+    assert any(o["cmd"] == "attack_move" and o["to"][0] > 50 for o in orders)  # obeys
+    assert b.status()["strength_ahead"] > 0  # and tells the commander what is there
+
+
+def test_build_named_while_in_production_is_that_one_not_another():
+    import time as _t
+    fake = FakeCommander({"build": "proc", "seq": 1})
+    b = RedAlertBot(log=lambda m: None, advisor=fake)
+    obs = _base_obs(production=[{"queue": "Building", "item": "proc", "progress": 0.5, "ready": False}])
+    b.choose_action(_state(obs), CTX)  # proc seen in production
+    # The refinery finishes; the commander's latest answer (asked while it was
+    # still building) still says "proc": not a new one.
+    fake._d.update(seq=2, asked_at=_t.monotonic(), t=_t.monotonic())  # asked just after that tick
+    b._sent.clear()
+    d = b.choose_action(_state(_base_obs()), CTX)
+    assert {"cmd": "build", "item": "proc"} not in (d.action["orders"] if isinstance(d, WithReasoning) else [])
+    # An answer asked after it left the queue and still asking for proc: a second one.
+    fake._d.update(seq=3, asked_at=_t.monotonic() + 3, t=_t.monotonic())
+    b._sent.clear()
+    assert {"cmd": "build", "item": "proc"} in _orders(b.choose_action(_state(_base_obs()), CTX))
+
+
+def test_army_inside_enemy_base_wrecks_buildings_in_priority_order():
+    army = [{"id": 100 + i, "type": "3tnk", "x": 70, "y": 70, "idle": True, "hp": 100} for i in range(5)]
+    theirs = [{"id": 900, "type": "fact", "x": 72, "y": 70, "hp": 100}, {"id": 901, "type": "proc", "x": 74, "y": 72, "hp": 60},
+              {"id": 902, "type": "powr", "x": 68, "y": 73, "hp": 100}, {"id": 903, "type": "weap", "x": 75, "y": 68, "hp": 100}]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 72, "main_y": 70}))
+    obs = _base_obs(units=army, visible_enemy_buildings=theirs)
+    orders = _orders(b.choose_action(_state(obs), CTX))
+    focus = [o for o in orders if o["cmd"] == "attack"]
+    assert focus and focus[-1]["target"] == 902  # the power plant before anything else
+    theirs.append({"id": 904, "type": "tsla", "x": 71, "y": 69, "hp": 100})
+    b._sent.clear()
+    orders = _orders(b.choose_action(_state(_base_obs(units=army, visible_enemy_buildings=theirs)), CTX))
+    assert [o for o in orders if o["cmd"] == "attack"][-1]["target"] == 904  # a defense that shoots back first
+
+
+def test_commanded_drainer_waits_for_power_when_it_would_go_negative():
+    fake = FakeCommander({"build": "weap"})
+    b = RedAlertBot(log=lambda m: None, advisor=fake)
+    obs = _base_obs()
+    obs["available_production"] = ["powr", "proc", "weap", "e1"]
+    obs["economy"].update(power_provided=100, power_drained=80)  # weap (-30) would make it -10
+    orders = _orders(b.choose_action(_state(obs), CTX))
+    assert {"cmd": "build", "item": "powr"} in orders and {"cmd": "build", "item": "weap"} not in orders
+    assert any("power" in p for p in b.status()["problems"])
+    # With the power plant up, the same order goes through.
+    obs["economy"].update(power_provided=200)
+    b._sent.clear()
+    assert {"cmd": "build", "item": "weap"} in _orders(b.choose_action(_state(obs), CTX))
+
+
+def test_attack_that_cleared_its_target_carries_on_to_known_buildings():
+    army = [{"id": 100 + i, "type": "3tnk", "x": 60, "y": 60, "idle": True, "hp": 100} for i in range(6)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 60, "main_y": 60}))
+    b._enemy_buildings = {950: {"id": 950, "type": "powr", "x": 78, "y": 78}}
+    orders = _orders(b.choose_action(_state(_base_obs(units=army)), CTX))
+    moves = [o for o in orders if o["cmd"] == "attack_move"]
+    assert moves and moves[-1]["to"][0] > 62 and "nothing there" in b.status()["main_state"]
+
+
+def test_strategy_hint_per_seat_reaches_general_and_commander(monkeypatch):
+    from agent import advisor
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    monkeypatch.setenv("STRATEGY_HINT", "seat0:rush with infantry,seat1:macro into tanks")
+    a = advisor.commanders_from_env(log=lambda m: None, seat=0)
+    b = advisor.commanders_from_env(log=lambda m: None, seat=1)
+    assert "rush with infantry" in a._layers["strategy"].system and "rush with infantry" in a._layers["tactical"].system
+    assert "macro into tanks" in b._layers["strategy"].system and "macro" not in a._layers["strategy"].system.split("Operator")[1]
+    assert "Operator instruction" not in b._layers["fast"].system
+
+
+def test_enemy_units_are_fought_before_buildings_by_everyone_in_reach():
+    army = [{"id": 100 + i, "type": "3tnk", "x": 60 + 3 * i, "y": 60, "idle": True, "hp": 100} for i in range(5)]
+    army.append({"id": 200, "type": "3tnk", "x": 90, "y": 60, "idle": True, "hp": 100})  # far from the fight
+    foes = [{"id": 900, "type": "e1", "x": 58, "y": 60, "hp": 100}, {"id": 901, "type": "e3", "x": 73, "y": 61, "hp": 50}]
+    theirs = [{"id": 950, "type": "powr", "x": 66, "y": 62, "hp": 100}, {"id": 951, "type": "weap", "x": 92, "y": 61, "hp": 100}]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 66, "main_y": 62}))
+    obs = _base_obs(units=army, visible_enemies=foes, visible_enemy_buildings=theirs)
+    orders = _orders(b.choose_action(_state(obs), CTX))
+    attacks = {}
+    for o in orders:
+        if o["cmd"] == "attack":
+            for i in o["units"]:
+                attacks[i] = o["target"]
+    assert all(attacks.get(100 + i) in (900, 901) for i in range(5))  # units first, never the power plant
+    assert attacks.get(200) == 951  # nobody near it: it wrecks the war factory
+    # In contact, the group does not stand still to regroup.
+    assert not any(o["cmd"] == "attack_move" and o["to"] == [66, 60] for o in orders)
+
+
+def test_scout_is_the_cheapest_unit_and_raid_unit_is_honoured():
+    units = [{"id": 100, "type": "1tnk", "x": 26, "y": 26, "idle": True, "hp": 100},
+             {"id": 101, "type": "e1", "x": 26, "y": 27, "idle": True, "hp": 100},
+             {"id": 102, "type": "ftrk", "x": 27, "y": 26, "idle": True, "hp": 100}]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 1}))
+    b.rules = {"1tnk": {"cost": 700, "speed": 2.76}, "e1": {"cost": 100, "speed": 1.32}, "ftrk": {"cost": 600, "speed": 2.76}}
+    b.choose_action(_state(_base_obs(units=units)), CTX)
+    assert b._raiders == {101}  # the rifleman scouts, not the tank
+    b2 = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 1, "raid_unit": "ftrk"}))
+    b2.rules = b.rules
+    b2.choose_action(_state(_base_obs(units=units)), CTX)
+    assert b2._raiders == {102}
+
+
+def test_outgunned_raid_is_not_refilled_for_a_while():
+    units = [{"id": 100 + i, "type": "e1", "x": 60, "y": 60, "idle": True, "hp": 100} for i in range(3)]
+    foes = [{"id": 900 + i, "type": "3tnk", "x": 62, "y": 60, "hp": 100} for i in range(4)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 2, "raid_x": 62, "raid_y": 60}))
+    b.choose_action(_state(_base_obs(units=units)), CTX)   # squad formed
+    assert len(b._raiders) == 2
+    b._sent.pop("raid", None)
+    b.choose_action(_state(_base_obs(units=units, visible_enemies=foes)), CTX)   # outgunned: runs home
+    assert not b._raiders and any("raid pulled back" in p for p in b.status()["problems"])
+    b.choose_action(_state(_base_obs(units=units, visible_enemies=foes)), CTX)   # not re-formed yet
+    assert not b._raiders
+
+
+def test_reinforcements_at_home_do_not_hold_the_front_group_back():
+    front = [{"id": 100 + i, "type": "3tnk", "x": 60, "y": 60, "idle": True, "hp": 100} for i in range(4)]
+    home = [{"id": 200 + i, "type": "3tnk", "x": 27, "y": 27, "idle": True, "hp": 100} for i in range(6)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 80}))
+    orders = _orders(b.choose_action(_state(_base_obs(units=front + home)), CTX))
+    front_moves = [o for o in orders if o["cmd"] == "attack_move" and {100, 101, 102, 103} <= set(o["units"])]
+    assert front_moves and front_moves[0]["to"][0] > 60  # the front advances; it does not wait at (60, 60)
+
+
+def test_raid_sneaks_around_the_enemy_army():
+    import time as _t
+    units = [{"id": 100 + i, "type": "ftrk", "x": 30, "y": 50, "idle": True, "hp": 100} for i in range(3)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 3, "raid_x": 80, "raid_y": 50}))
+    b.rules = {"ftrk": {"cost": 600, "speed": 2.76}, "3tnk": {"cost": 1150}}
+    # Their army sits on the direct line, a little to the north (y < 50).
+    b._enemy_army = {900 + i: {"type": "3tnk", "hp": 100, "x": 55, "y": 45, "t": _t.monotonic()} for i in range(5)}
+    obs = _obs(buildings=[{"id": 1, "type": "fact", "x": 20, "y": 50}], units=units, base_center=[20, 50])
+    orders = _orders(b.choose_action(_state(obs), CTX))
+    moves = [o for o in orders if o["cmd"] == "move" and set(o["units"]) == {100, 101, 102}]
+    assert moves and moves[0]["to"][1] > 60  # flanks to the south, away from their tanks
+    assert any(o["cmd"] == "attack_move" and o["to"] == [80, 50] and o.get("queued") for o in orders)
+    # With nothing in the way the raid goes straight.
+    b2 = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 3, "raid_x": 80, "raid_y": 50}))
+    b2.rules = b.rules
+    orders = _orders(b2.choose_action(_state(obs), CTX))
+    assert any(o["cmd"] == "move" and o["to"] == [80, 50] for o in orders)
+
+
+def test_a_blob_at_home_marches_out_together_when_told_to_attack():
+    # 40 riflemen spread around the staging point, nobody "out in the field" yet.
+    army = [{"id": 100 + i, "type": "e1", "x": 22 + i % 8, "y": 22 + i // 8, "idle": True, "hp": 100} for i in range(40)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 80}))
+    orders = _orders(b.choose_action(_state(_base_obs(units=army)), CTX))
+    moves = [o for o in orders if o["cmd"] == "attack_move"]
+    forward = {i for o in moves if o["to"][0] >= 30 and o["to"][1] >= 30 for i in o["units"]}
+    assert len(forward) >= 20  # the front half heads for the enemy
+    assert not any(o["to"][0] < 24 for o in moves)  # nobody is sent backwards into the base

@@ -3,16 +3,15 @@
 The scripted bot (``agent/redalert_bot.py``) plays every tick by itself and
 never waits for a model. Above it, three layers run at different speeds:
 
-| Layer     | Default model       | Effort | Every | Decides                                               |
-|-----------|---------------------|--------|-------|-------------------------------------------------------|
-| strategy  | ``claude-fable-5-1`` | medium | 90 s  | posture, unit focus, defenses, refineries, a game plan |
-| tactical  | ``claude-opus-5-5``  | low    | 20 s  | wave size, attack now / retreat, where to attack       |
-| fast      | off (rules do it)   | low, thinking off | 4 s, only while fighting | focus-fire target, pull back damaged units |
+| Layer      | Default model        | Effort            | Every                     | Decides                                   |
+|------------|----------------------|-------------------|---------------------------|-------------------------------------------|
+| strategy   | ``claude-opus-5-5``   | medium            | 15 s                      | the game plan, build targets, what to avoid |
+| tactical   | ``claude-sonnet-5-5`` | low               | continuously (3 s apart)  | production and every army move (field commander) |
+| fast       | ``claude-haiku-5-5``  | low, thinking off | 3 s, only while fighting  | focus-fire target, pull back damaged units |
 
-The fast layer is off by default: the bot's own micro rules pick focus-fire
-targets and pull back damaged units 5 times a second with no latency, which
-beats any model call at this speed. ``FAST_MODEL=claude-sonnet-5-5`` (or a
-Haiku) turns it back on, and its answers then override the rules.
+The bot keeps sub-second reflexes in code (kiting, focus fire, placing
+buildings, harvesting, home defense, emergency retreat) and falls back to its
+own rules when the field commander has been silent for 20 s.
 
 Each layer sees the layer above's latest instructions, so the plan flows
 down: Fable's plan → Opus's tactics → Sonnet's micro. A slow or failing
@@ -30,6 +29,7 @@ import json
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 # --- schemas -----------------------------------------------------------------------
@@ -41,22 +41,42 @@ STRATEGY_SCHEMA = {
         "unit_focus": {"type": "string", "enum": ["tanks", "infantry", "mixed", "anti_armor"]},
         "defenses": {"type": "integer"},
         "max_refineries": {"type": "integer"},
+        "build_targets": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"item": {"type": "string"}, "count": {"type": "integer"}},
+                "required": ["item", "count"],
+                "additionalProperties": False,
+            },
+        },
+        "avoid": {"type": "array", "items": {"type": "string"}},
         "plan": {"type": "string"},
     },
-    "required": ["posture", "unit_focus", "defenses", "max_refineries", "plan"],
+    "required": ["posture", "unit_focus", "defenses", "max_refineries", "build_targets", "avoid", "plan"],
     "additionalProperties": False,
 }
 
 TACTICAL_SCHEMA = {
     "type": "object",
     "properties": {
-        "attack_size": {"type": "integer"},
-        "action": {"type": "string", "enum": ["continue", "attack_now", "retreat"]},
-        "target_x": {"type": "integer"},
-        "target_y": {"type": "integer"},
+        "build": {"type": "string"},
+        "defense": {"type": "string"},
+        "infantry": {"type": "string"},
+        "infantry_count": {"type": "integer"},
+        "vehicle": {"type": "string"},
+        "vehicle_count": {"type": "integer"},
+        "main_action": {"type": "string", "enum": ["attack", "hold", "retreat", "defend"]},
+        "main_x": {"type": "integer"},
+        "main_y": {"type": "integer"},
+        "raid_size": {"type": "integer"},
+        "raid_unit": {"type": "string"},
+        "raid_x": {"type": "integer"},
+        "raid_y": {"type": "integer"},
         "note": {"type": "string"},
     },
-    "required": ["attack_size", "action", "target_x", "target_y", "note"],
+    "required": ["build", "defense", "infantry", "infantry_count", "vehicle", "vehicle_count", "main_action",
+                 "main_x", "main_y", "raid_size", "raid_unit", "raid_x", "raid_y", "note"],
     "additionalProperties": False,
 }
 
@@ -70,32 +90,60 @@ FAST_SCHEMA = {
     "additionalProperties": False,
 }
 
-GAME_RULES = """Command & Conquer: Red Alert (OpenRA), live 1v1 against another AI agent, real time (25 ticks/s). \
-Destroying every enemy building and the MCV wins. Otherwise, at the time limit the higher \
-(kills_cost - deaths_cost) wins, then higher assets_value: trade efficiently, keep your army alive when ahead \
-late, push hard when behind with time running out. A fast scripted bot executes everything (build order, power, \
-harvesters, production, base defense, attack waves, retreats); you steer it."""
+# The playbook is a plain Markdown file so it can be edited without touching code.
+PLAYBOOK = (Path(__file__).with_name("playbook.md")).read_text(encoding="utf-8")
 
-STRATEGY_PROMPT = GAME_RULES + """
+STRATEGY_PROMPT = PLAYBOOK + """
 
-You are the STRATEGIC commander (called every ~90 s). Set the overall direction:
-- posture: economy (more refineries, bigger later waves), balanced, aggressive (smaller earlier waves, no \
-retreats), defensive (more static defenses, bigger waves).
+## Your role: the GENERAL
+You are called every ~15-30 s. A field commander (another model, asked every few seconds) runs production and the \
+army following your plan; the bot uses your knobs only if the commander goes silent. Decide:
+- posture: economy (more refineries, bigger later waves), balanced, aggressive (early pressure, no retreats), \
+defensive (more static defenses, bigger waves).
 - unit_focus: tanks, infantry, mixed, anti_armor (more rocket infantry).
 - defenses: static defenses to keep (0-6). max_refineries: 1-5.
-- plan: 2-3 sentences for your tactical officer: what to aim for in the next minutes and why (enemy faction, \
-what you've seen, economy, the clock).
+- build_targets: up to 4 {item, count} the bot reaches FIRST, before anything else, e.g. [{"item": "proc", \
+"count": 2}, {"item": "harv", "count": 4}]. Counts are totals you want to own (buildings or units); names from \
+available_production / my_buildings / my_units. [] to leave it alone. The bot keeps power positive by itself.
+- avoid: items the bot must not build or train until your next call, e.g. ["dome"] to save money. [] for none. \
+Never avoid a prerequisite of something you want (the bot ignores such an avoid anyway).
+- plan: 2-4 sentences for your commander: the opening (rush or macro and why, from the enemy faction and what the \
+scout saw), when the first attack and the raids go out, what to target, how to play the clock. Plans must USE the \
+army: the first attack or raid goes out by minute 2-3 and the army keeps fighting or raiding from then on.
 Reply with the JSON only."""
 
-TACTICAL_PROMPT = GAME_RULES + """
+TACTICAL_PROMPT = PLAYBOOK + """
 
-You are the TACTICAL officer (called every ~20 s), following the strategic plan you are given.
-- attack_size: combat units needed before the next wave launches (4-24).
-- action: continue (let the bot decide), attack_now (launch a wave now with what we have), retreat (pull the \
-army back home to regroup).
-- target_x, target_y: the cell the next/current wave should attack (e.g. a weak enemy building or expansion you \
-know of); -1, -1 to let the bot pick (nearest known enemy building, else the enemy base).
-- note: one short sentence for the record.
+## Your role: the FIELD COMMANDER
+You are asked again the moment you answer (every few seconds) with the newest view, and you decide everything the \
+base and army do next, following the general's plan. Your previous answer stays in force until the next one: the \
+bot starts your build/defense choice once per answer (so repeating "proc" every answer queues ONE refinery at a \
+time, not several) and keeps the infantry/vehicle queues producing what you last said.
+
+Production (four queues run in parallel; the bot starts your choice the moment that queue is free):
+- build: the next building ("proc", "weap", "powr", ...), "" for nothing, "auto" to let the bot choose.
+- defense: the next static defense ("ftur", "tsla", "pbox", "gun", ...), "" or "auto".
+- infantry / vehicle: the unit that queue keeps producing (e.g. "e1", "e3", "3tnk", "harv", "ftrk"), with how many \
+per batch (1-5); "" to stop that queue, "auto" for the bot's choice.
+Use only names in bot.catalog (what we can build right now, with [cost, queue]). bot.problems lists choices the \
+bot could not carry out and why.
+
+Army:
+- main_action: attack (the main army advances on main_x, main_y as one group, fighting what it meets; the bot does \
+NOT stop for what is ahead, you decide that from bot.strength_ahead), hold (gather at main_x, main_y), retreat \
+(go home), defend (fight the enemies near our base). main_x/main_y: -1 = default (enemy base for attack, our \
+staging point for hold).
+- raid_size: how many units form the raid squad (0 recalls it); raid_unit: their type ("" = the fastest \
+available, e.g. ftrk/jeep/1tnk; "e1" for a cheap scout). A squad of 1 is a scout: use "e1", never a tank (a lone \
+700-credit tank chased by infantry is a gift to the enemy). raid_x/raid_y: the target (-1,-1 = the enemy ore \
+field, where their harvesters are; bot.enemy_ore_field). A squad that runs home outgunned is not re-formed for \
+20 s (bot.problems says so).
+- note: one short sentence for spectators.
+
+bot.main_state says what the main army is doing, bot.our_army_strength / enemy_army_known_strength compare \
+armies (credits of units, hp-weighted), bot.strength_ahead is the enemy force within reach of the main army's \
+next step, bot.main_idle_seconds how long the army has been held, bot.threat_near_base_strength what is at our \
+base. Visible enemies come with cells; known_enemy_buildings with cells and types.
 Reply with the JSON only."""
 
 FAST_PROMPT = """You micro-manage a fight in Command & Conquer: Red Alert (real time) for a scripted bot. You get \
@@ -109,11 +157,16 @@ JSON only."""
 
 LAYERS = {
     # name: (model env, default model, effort env, default effort, every seconds, timeout seconds, max calls)
-    "strategy": ("STRATEGY_MODEL", "claude-fable-5-1", "STRATEGY_EFFORT", "medium", 90.0, 150.0, 20),
-    "tactical": ("TACTICAL_MODEL", "claude-opus-5-5", "TACTICAL_EFFORT", "low", 20.0, 45.0, 80),
-    "fast": ("FAST_MODEL", "off", "FAST_EFFORT", "low", 4.0, 15.0, 400),
+    "strategy": ("STRATEGY_MODEL", "claude-opus-5-5", "STRATEGY_EFFORT", "medium", 15.0, 90.0, 120),
+    "tactical": ("TACTICAL_MODEL", "claude-sonnet-5-5", "TACTICAL_EFFORT", "low", 3.0, 30.0, 500),
+    "fast": ("FAST_MODEL", "claude-haiku-5-5", "FAST_EFFORT", "low", 4.0, 15.0, 400),
 }
 FIGHT_RADIUS = 14  # the fast layer only runs while enemies are this close to our army
+# USD per million tokens (input, output), for the live cost report.
+PRICES = {
+    "claude-fable-5-1": (10.0, 50.0), "claude-opus-5-5": (4.0, 20.0),
+    "claude-sonnet-5-5": (2.0, 10.0), "claude-haiku-5-5": (0.10, 0.50),
+}
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
@@ -132,6 +185,10 @@ class Layer:
         self._last = -1e9
         self.calls = 0
         self.failures = 0
+        self.answers = 0
+        self.tokens_in = 0
+        self.tokens_out = 0
+        self.seconds = 0.0
 
     def due(self) -> bool:
         return not self._busy and time.monotonic() - self._last >= self.every and self.calls < self.max_calls
@@ -142,33 +199,66 @@ class Layer:
         self.calls += 1
         threading.Thread(target=self._ask, args=(payload, handle), daemon=True).start()
 
+    def _count(self, response: Any, seconds: float) -> None:
+        usage = getattr(response, "usage", None)
+        self.answers += 1
+        self.seconds += seconds
+        if usage is not None:
+            self.tokens_in += int(getattr(usage, "input_tokens", 0) or 0) + int(
+                getattr(usage, "cache_creation_input_tokens", 0) or 0)
+            # Cache reads cost about a tenth of fresh input tokens.
+            self.tokens_in += int(getattr(usage, "cache_read_input_tokens", 0) or 0) // 10
+            self.tokens_out += int(getattr(usage, "output_tokens", 0) or 0)
+
+    def cost(self) -> float | None:
+        price = next((p for m, p in PRICES.items() if self.model.startswith(m)), None)
+        if price is None:
+            return None
+        return (self.tokens_in * price[0] + self.tokens_out * price[1]) / 1e6
+
+    def report(self) -> str:
+        cost = self.cost()
+        avg = self.seconds / self.answers if self.answers else 0.0
+        money = f"${cost:.2f}" if cost is not None else "$?"
+        return f"{self.name}={self.model.removeprefix('claude-')} {money} ({self.answers} answers, avg {avg:.1f}s)"
+
     def _request_kwargs(self) -> dict:
         kwargs: dict[str, Any] = {
             "model": self.model,
             "max_tokens": 16000 if self.name == "strategy" else 4000,
-            "system": self.system,
+            # The playbook is long and identical every call: cache it.
+            "system": [{"type": "text", "text": self.system, "cache_control": {"type": "ephemeral"}}],
             "output_config": {"effort": self.effort, "format": {"type": "json_schema", "schema": self.schema}},
-            "betas": ["server-side-fallback-2026-07-01"],
-            "fallbacks": "default",
         }
-        # Sonnet 5.5: thinking off for the lowest latency (accepted at effort high or below).
-        if self.model.startswith("claude-sonnet-5-5") and self.effort in ("low", "medium", "high"):
-            kwargs["thinking"] = {"type": "between_tools"}
+        # Server-side refusal fallback: Opus/Sonnet/Fable only (Haiku has none).
+        if not self.model.startswith("claude-haiku"):
+            kwargs["betas"] = ["server-side-fallback-2026-07-01"]
+            kwargs["fallbacks"] = "default"
+        # The micro layer must answer fast: thinking off (both accepted at effort high or below).
+        if self.name == "fast" and self.effort in ("low", "medium", "high"):
+            if self.model.startswith("claude-haiku-5-5"):
+                kwargs["thinking"] = {"type": "disabled"}
+            elif self.model.startswith("claude-sonnet-5-5"):
+                kwargs["thinking"] = {"type": "between_tools"}
         return kwargs
 
     def _ask(self, payload: dict, handle: Callable[[dict], None]) -> None:
         import anthropic
 
         started = time.monotonic()
+        kwargs = self._request_kwargs()
         try:
-            response = self._client.with_options(timeout=self.timeout).beta.messages.create(
+            api = self._client.with_options(timeout=self.timeout)
+            create = api.beta.messages.create if "betas" in kwargs else api.messages.create
+            response = create(
                 messages=[{"role": "user", "content": json.dumps(payload, separators=(",", ":"))}],
-                **self._request_kwargs(),
+                **kwargs,
             )
             if response.stop_reason == "refusal":
                 self._log(f"[{self.name}] request declined; keeping current instructions")
                 return
             text = next((b.text for b in response.content if b.type == "text"), "")
+            self._count(response, time.monotonic() - started)
             handle(json.loads(text))
             if self.name != "fast" or self.calls % 10 == 1:
                 self._log(f"[{self.name}] answered in {time.monotonic() - started:.1f}s ({self.model}, {self.effort})")
@@ -194,12 +284,18 @@ class Commanders:
         self._plan = ""
         self._plans: list[str] = []
         self._tactical_note = ""
+        self._decision: dict | None = None
+        self._seq = 0
 
     # -- read by the bot -------------------------------------------------------------
 
     def knobs(self) -> dict[str, Any]:
         with self._lock:
             return dict(self._knobs)
+
+    def cost_report(self) -> str:
+        total = sum(l.cost() or 0.0 for l in self._layers.values())
+        return f"${total:.2f} so far: " + ", ".join(l.report() for l in self._layers.values())
 
     def pop_commands(self) -> list[dict]:
         with self._lock:
@@ -208,19 +304,30 @@ class Commanders:
 
     # -- called on every decision ------------------------------------------------------
 
-    def observe(self, raw: dict) -> None:
+    def observe(self, raw: dict, bot_status: dict | None = None) -> None:
         summary = summarize(raw)
         if summary is None:
             return
+        summary["bot_status"] = bot_status or {}
         strategy = self._layers.get("strategy")
         if strategy and strategy.due():
             strategy.run({"previous_plans": self._plans[-3:], "match": summary}, self._on_strategy)
         tactical = self._layers.get("tactical")
         if tactical and tactical.due():
+            obs = raw.get("observation") or {}
+            asked = time.monotonic()
             tactical.run(
-                {"strategic_plan": self._plan, "your_last_note": self._tactical_note, "match": summary,
-                 "army": army_view(raw), "known_enemy_buildings": summary["visible_enemy_buildings_cells"]},
-                self._on_tactical,
+                {"situation": (bot_status or {}).get("situation"),
+                 "strategic_plan": self._plan, "general_build_targets": self._knobs.get("build_targets"),
+                 "general_avoid": self._knobs.get("avoid"), "your_last_note": self._tactical_note,
+                 "match": {k: v for k, v in summary.items() if k not in ("bot_status", "visible_enemy_buildings_cells")},
+                 "known_enemy_buildings": (bot_status or {}).get("known_enemy_buildings"),
+                 "bot": {k: v for k, v in (bot_status or {}).items() if k not in ("known_enemy_buildings", "situation")},
+                 "army": army_view(raw),
+                 "visible_enemies": [
+                     {k: e.get(k) for k in ("type", "x", "y", "hp")} for e in _alive(obs.get("visible_enemies"))[:30]
+                 ]},
+                lambda answer, asked=asked: self._on_tactical(answer, asked),
             )
         fast = self._layers.get("fast")
         if fast and fast.due():
@@ -232,7 +339,14 @@ class Commanders:
     # -- answers -------------------------------------------------------------------------
 
     def _on_strategy(self, a: dict) -> None:
+        targets = []
+        for t in a.get("build_targets") or []:
+            if isinstance(t, dict) and isinstance(t.get("item"), str):
+                targets.append((t["item"].strip().lower()[:12], max(0, min(12, int(t.get("count", 1))))))
+        avoid = [str(x).strip().lower()[:12] for x in a.get("avoid") or [] if isinstance(x, str)][:6]
         knobs = {
+            "build_targets": targets[:4],
+            "avoid": avoid,
             "posture": a["posture"] if a.get("posture") in ("economy", "balanced", "aggressive", "defensive") else "balanced",
             "unit_focus": a["unit_focus"] if a.get("unit_focus") in ("tanks", "infantry", "mixed", "anti_armor") else "mixed",
             "defenses": max(0, min(6, int(a.get("defenses", 2)))),
@@ -244,19 +358,45 @@ class Commanders:
             self._plan = plan
         self._plans.append(plan)
         self._log(f"[strategy] {knobs['posture']}, {knobs['unit_focus']}, {knobs['defenses']} defenses, "
-                  f"{knobs['max_refineries']} refineries: {plan[:200]}")
+                  f"{knobs['max_refineries']} refineries, build first {targets[:4]}, avoid {avoid}: {plan[:200]}")
 
-    def _on_tactical(self, a: dict) -> None:
-        size = max(4, min(24, int(a.get("attack_size", 8))))
-        tx, ty = int(a.get("target_x", -1)), int(a.get("target_y", -1))
-        action = a.get("action")
-        with self._lock:
-            self._knobs["attack_size"] = size
-            self._knobs["target"] = (tx, ty) if tx >= 0 and ty >= 0 else None
-            if action in ("attack_now", "retreat"):
-                self._commands.append({"type": action})
+    def _on_tactical(self, a: dict, asked_at: float | None = None) -> None:
+        def name(key: str) -> str:
+            return str(a.get(key, "auto")).strip().lower()[:12]
+
+        def num(key: str, lo: int, hi: int, default: int) -> int:
+            try:
+                return max(lo, min(hi, int(a.get(key, default))))
+            except (TypeError, ValueError):
+                return default
+
+        action = a.get("main_action") if a.get("main_action") in ("attack", "hold", "retreat", "defend") else "hold"
+        decision = {
+            "build": name("build"), "defense": name("defense"),
+            "infantry": name("infantry"), "infantry_count": num("infantry_count", 1, 5, 2),
+            "vehicle": name("vehicle"), "vehicle_count": num("vehicle_count", 1, 5, 1),
+            "main_action": action, "main_x": num("main_x", -1, 500, -1), "main_y": num("main_y", -1, 500, -1),
+            "raid_size": num("raid_size", 0, 8, 0), "raid_unit": "" if name("raid_unit") in ("auto", "") else name("raid_unit"),
+            "raid_x": num("raid_x", -1, 500, -1),
+            "raid_y": num("raid_y", -1, 500, -1),
+        }
         self._tactical_note = str(a.get("note", ""))[:200]
-        self._log(f"[tactical] {action}, waves of {size}, target {(tx, ty) if tx >= 0 else 'auto'}: {self._tactical_note}")
+        with self._lock:
+            self._seq += 1
+            self._decision = {**decision, "seq": self._seq, "t": time.monotonic(),
+                              "asked_at": asked_at if asked_at is not None else time.monotonic()}
+        where = f"({decision['main_x']},{decision['main_y']})" if decision["main_x"] >= 0 else "default"
+        self._log(
+            f"[commander] build={decision['build'] or '-'} def={decision['defense'] or '-'} "
+            f"inf={decision['infantry'] or '-'}x{decision['infantry_count']} "
+            f"veh={decision['vehicle'] or '-'}x{decision['vehicle_count']} main={action}@{where} "
+            f"raid={decision['raid_size']}{(' ' + decision['raid_unit']) if decision['raid_unit'] else ''}: {self._tactical_note}"
+        )
+
+    def decision(self) -> dict | None:
+        """The field commander's latest decision (with ``seq`` and ``t``), if any."""
+        with self._lock:
+            return dict(self._decision) if self._decision else None
 
     def _on_fast(self, a: dict) -> None:
         cmds = []
@@ -308,6 +448,7 @@ def summarize(raw: dict) -> dict | None:
         "production": [
             {k: p.get(k) for k in ("queue", "item", "progress")} for p in (obs.get("production") or [])[:10] if isinstance(p, dict)
         ],
+        "available_production": sorted(str(a) for a in obs.get("available_production") or [])[:40],
         "visible_enemy_units": _types(obs.get("visible_enemies")),
         "visible_enemy_buildings": _types(obs.get("visible_enemy_buildings")),
         "visible_enemy_buildings_cells": [
@@ -359,7 +500,19 @@ def fight_view(raw: dict) -> dict | None:
 
 # --- construction -------------------------------------------------------------------------
 
-def commanders_from_env(log: Callable[[str], None] = print) -> Commanders | None:
+def seat_env(name: str, seat: int | None) -> str | None:
+    """An env value, or this seat's part of ``seat0:a,seat1:b`` (for A/B tests)."""
+    value = os.environ.get(name)
+    if not value or "seat" not in value or ":" not in value:
+        return value
+    for part in value.split(","):
+        key, _, v = part.partition(":")
+        if key.strip().lower() == f"seat{seat}":
+            return v.strip()
+    return None
+
+
+def commanders_from_env(log: Callable[[str], None] = print, seat: int | None = None) -> Commanders | None:
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         return None
@@ -376,15 +529,23 @@ def commanders_from_env(log: Callable[[str], None] = print) -> Commanders | None
     }
     layers: dict[str, Layer] = {}
     for name, (model_env, model, effort_env, effort, every, timeout, max_calls) in LAYERS.items():
-        model = os.environ.get(model_env) or model
+        model = seat_env(model_env, seat) or model
         if not model or model.lower() == "off":
             continue
-        effort = os.environ.get(effort_env) or effort
+        effort = seat_env(effort_env, seat) or effort
         if effort not in EFFORTS:
             effort = LAYERS[name][3]
+        try:
+            every = float(seat_env(f"{name.upper()}_EVERY", seat) or every)
+        except ValueError:
+            pass
         system, schema = prompts[name]
+        # An operator's instruction for this match (A/B tests: STRATEGY_HINT=seat0:...,seat1:...).
+        hint = seat_env("STRATEGY_HINT", seat)
+        if hint and name in ("strategy", "tactical"):
+            system += f"\n\n## Operator instruction for this match (follow it)\n{hint.strip()}\n"
         layers[name] = Layer(name, client, model, effort, every, timeout, max_calls, system, schema, log)
     if not layers:
         return None
-    log("[commanders] " + ", ".join(f"{n}={l.model}/{l.effort}" for n, l in layers.items()))
+    log("[commanders] " + ", ".join(f"{n}={l.model}/{l.effort}/every {l.every:g}s" for n, l in layers.items()))
     return Commanders(layers, log)
