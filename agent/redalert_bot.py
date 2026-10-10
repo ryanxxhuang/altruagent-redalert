@@ -240,6 +240,8 @@ class RedAlertBot:
         self._started_at: dict[str, float] = {}      # when we last started each building
         self._prod_seen: dict[str, list[float]] = {} # item -> [first, last] time seen in a queue (this run)
         self._holding_since: float | None = None     # game time the main army started idling at home
+        self._onward: tuple[int, int] | None = None  # where an attack carries on after clearing its target
+        self._onward_for: tuple | None = None        # the commander's target that onward belongs to
         self._retreat_issued = False
         self._wave_peak = 0
         self._last_status = 0.0
@@ -1223,9 +1225,13 @@ class RedAlertBot:
         def cell(x: int, y: int, default):
             return self._clamp((x, y), raw) if x >= 0 and y >= 0 else default
 
-        # Raid squad: the size and target the commander chose.
+        # Raid squad: the size the commander chose, at least the general's
+        # standing raid (unless enemies are at our base and everyone is needed).
         self._raiders &= set(alive)
         size = d["raid_size"]
+        standing = int(self.knobs.get("standing_raid", 0) or 0)
+        if standing > size and self._threat <= 0 and len(alive) >= standing + 4:
+            size = standing
         if size <= 0 and self._raiders:
             if staging:
                 orders.append({"cmd": "move", "units": sorted(self._raiders)[:max_units], "to": list(staging)})
@@ -1295,7 +1301,10 @@ class RedAlertBot:
         else:
             self._holding_since = None
         if action == "attack":
-            target = cell(d["main_x"], d["main_y"], None) or self._attack_target(enemies, force, enemy_base)
+            ordered = cell(d["main_x"], d["main_y"], None) or self._attack_target(enemies, force, enemy_base)
+            if self._onward_for != (d["main_x"], d["main_y"]):
+                self._onward, self._onward_for = None, (d["main_x"], d["main_y"])
+            target = self._onward or ordered
             if not self._attacking:
                 self._attacking = True
                 self._wave += 1
@@ -1308,28 +1317,33 @@ class RedAlertBot:
                 self.log(f"[bot] {self._main_state}")
                 return micro + orders + self._move_home([u["id"] for u in force], staging, max_units)
             if target and force and not self._recent("attack", 2.0):
-                # Reached the target and nothing is there: an attack that has
-                # cleared its point carries on to the nearest known enemy
-                # building rather than standing in an empty field.
+                # Reached the target and (almost) nothing is there: an attack
+                # that has cleared its point carries on to the nearest known
+                # enemy building, and keeps doing so until the commander gives
+                # a new target, rather than standing in an empty field.
                 centre = self._centroid([_xy(u) for u in force])
                 at_target = centre is not None and _dist(centre, target) <= 5
-                nothing_near = not any(_dist(_xy(e), centre) <= 10 for e in enemies if _xy(e)) and not any(
+                quiet = centre is not None and sum(
+                    self._strength(e) for e in enemies if _xy(e) and _dist(_xy(e), centre) <= 10) < 300 and not any(
                     _dist(_xy(b), centre) <= STRUCTURE_FOCUS_RANGE
-                    for b in getattr(self, "_visible_enemy_buildings", []) if _xy(b)
-                ) if centre else False
-                if at_target and nothing_near:
+                    for b in getattr(self, "_visible_enemy_buildings", []) if _xy(b))
+                if at_target and quiet:
                     onward = self._attack_target(enemies, force, enemy_base)
                     if onward and _dist(onward, target) > 5:
                         self.log(f"[bot] reached {list(target)}, nothing there; carrying on to {list(onward)}")
+                        self._onward = onward
                         target = onward
-                        self._main_state = f"reached the ordered target, nothing there; carrying on to {list(onward)}"
                 step = self._advance(raw, force, enemies, target, staging, notes, give_up=False, obey=True)
                 orders += step
                 self._mark("attack")
-                if not self._main_state.startswith("reached"):
+                if self._onward:
+                    self._main_state = (f"ordered target {list(ordered)} was empty; carrying on to {list(self._onward)}: "
+                                        + (notes[-1] if notes else ""))
+                else:
                     self._main_state = f"attacking {list(target)}: " + (notes[-1] if notes else "")
         elif action == "hold":
             self._attacking = False
+            self._onward = None
             spot = cell(d["main_x"], d["main_y"], staging)
             if spot and not self._recent("hold", 3.0):
                 ids = [u["id"] for u in force if _dist(_xy(u), spot) > 4 and (u.get("idle") or not self._recent("hold_all", 10.0))]

@@ -51,9 +51,10 @@ STRATEGY_SCHEMA = {
             },
         },
         "avoid": {"type": "array", "items": {"type": "string"}},
+        "standing_raid": {"type": "integer"},
         "plan": {"type": "string"},
     },
-    "required": ["posture", "unit_focus", "defenses", "max_refineries", "build_targets", "avoid", "plan"],
+    "required": ["posture", "unit_focus", "defenses", "max_refineries", "build_targets", "avoid", "standing_raid", "plan"],
     "additionalProperties": False,
 }
 
@@ -107,6 +108,9 @@ defensive (more static defenses, bigger waves).
 available_production / my_buildings / my_units. [] to leave it alone. The bot keeps power positive by itself.
 - avoid: items the bot must not build or train until your next call, e.g. ["dome"] to save money. [] for none. \
 Never avoid a prerequisite of something you want (the bot ignores such an avoid anyway).
+- standing_raid: the raid squad the commander must keep out at all times (0-4 units; the bot tops the commander's \
+raid_size up to this unless our base is under attack). Raids on their harvesters run ALL GAME: set 3 as soon \
+as we have 8+ combat units or any fast vehicles, 0 only while every unit is needed to survive.
 - plan: 2-4 sentences for your commander: the opening (rush or macro and why, from the enemy faction and what the \
 scout saw), when the first attack and the raids go out, what to target, how to play the clock. Plans must USE the \
 army: the first attack or raid goes out by minute 2-3 and the army keeps fighting or raiding from then on.
@@ -133,7 +137,8 @@ Army:
 NOT stop for what is ahead, you decide that from bot.strength_ahead), hold (gather at main_x, main_y), retreat \
 (go home), defend (fight the enemies near our base). main_x/main_y: -1 = default (enemy base for attack, our \
 staging point for hold).
-- raid_size: how many units form the raid squad (0 recalls it); raid_unit: their type ("" = the fastest \
+- raid_size: how many units form the raid squad (0 recalls it; the general's standing_raid is the minimum the \
+bot keeps out, general_standing_raid in your input); raid_unit: their type ("" = the fastest \
 available, e.g. ftrk/jeep/1tnk; "e1" for a cheap scout). A squad of 1 is a scout: use "e1", never a tank (a lone \
 700-credit tank chased by infantry is a gift to the enemy). raid_x/raid_y: the target (-1,-1 = the enemy ore \
 field, where their harvesters are; bot.enemy_ore_field). A squad that runs home outgunned is not re-formed for \
@@ -199,6 +204,19 @@ class Layer:
         self.calls += 1
         threading.Thread(target=self._ask, args=(payload, handle), daemon=True).start()
 
+    def _dump(self, payload: dict, answer: str) -> None:
+        """Keep the latest prompt and answer of this layer in logs/ so a human
+        can read exactly what the model saw and decided."""
+        try:
+            folder = Path(os.environ.get("REDALERT_DUMP_DIR") or "logs")
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / f"{self.name}-last.json").write_text(json.dumps(
+                {"model": self.model, "effort": self.effort, "system_prompt": self.system,
+                 "input": payload, "answer": json.loads(answer) if answer.startswith("{") else answer},
+                indent=1, ensure_ascii=False), encoding="utf-8")
+        except (OSError, ValueError):
+            pass
+
     def _count(self, response: Any, seconds: float) -> None:
         usage = getattr(response, "usage", None)
         self.answers += 1
@@ -259,6 +277,7 @@ class Layer:
                 return
             text = next((b.text for b in response.content if b.type == "text"), "")
             self._count(response, time.monotonic() - started)
+            self._dump(payload, text)
             handle(json.loads(text))
             if self.name != "fast" or self.calls % 10 == 1:
                 self._log(f"[{self.name}] answered in {time.monotonic() - started:.1f}s ({self.model}, {self.effort})")
@@ -318,6 +337,7 @@ class Commanders:
             asked = time.monotonic()
             tactical.run(
                 {"situation": (bot_status or {}).get("situation"),
+                 "general_standing_raid": self._knobs.get("standing_raid", 0),
                  "strategic_plan": self._plan, "general_build_targets": self._knobs.get("build_targets"),
                  "general_avoid": self._knobs.get("avoid"), "your_last_note": self._tactical_note,
                  "match": {k: v for k, v in summary.items() if k not in ("bot_status", "visible_enemy_buildings_cells")},
@@ -344,9 +364,14 @@ class Commanders:
             if isinstance(t, dict) and isinstance(t.get("item"), str):
                 targets.append((t["item"].strip().lower()[:12], max(0, min(12, int(t.get("count", 1))))))
         avoid = [str(x).strip().lower()[:12] for x in a.get("avoid") or [] if isinstance(x, str)][:6]
+        try:
+            standing = max(0, min(4, int(a.get("standing_raid", 0))))
+        except (TypeError, ValueError):
+            standing = 0
         knobs = {
             "build_targets": targets[:4],
             "avoid": avoid,
+            "standing_raid": standing,
             "posture": a["posture"] if a.get("posture") in ("economy", "balanced", "aggressive", "defensive") else "balanced",
             "unit_focus": a["unit_focus"] if a.get("unit_focus") in ("tanks", "infantry", "mixed", "anti_armor") else "mixed",
             "defenses": max(0, min(6, int(a.get("defenses", 2)))),
@@ -358,7 +383,8 @@ class Commanders:
             self._plan = plan
         self._plans.append(plan)
         self._log(f"[strategy] {knobs['posture']}, {knobs['unit_focus']}, {knobs['defenses']} defenses, "
-                  f"{knobs['max_refineries']} refineries, build first {targets[:4]}, avoid {avoid}: {plan[:200]}")
+                  f"{knobs['max_refineries']} refineries, standing raid {standing}, build first {targets[:4]}, "
+                  f"avoid {avoid}: {plan[:200]}")
 
     def _on_tactical(self, a: dict, asked_at: float | None = None) -> None:
         def name(key: str) -> str:

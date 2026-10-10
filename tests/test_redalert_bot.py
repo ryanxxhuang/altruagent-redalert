@@ -556,7 +556,7 @@ def test_attack_that_cleared_its_target_carries_on_to_known_buildings():
     b._enemy_buildings = {950: {"id": 950, "type": "powr", "x": 78, "y": 78}}
     orders = _orders(b.choose_action(_state(_base_obs(units=army)), CTX))
     moves = [o for o in orders if o["cmd"] == "attack_move"]
-    assert moves and moves[-1]["to"][0] > 62 and "nothing there" in b.status()["main_state"]
+    assert moves and moves[-1]["to"][0] > 62 and "carrying on" in b.status()["main_state"]
 
 
 def test_strategy_hint_per_seat_reaches_general_and_commander(monkeypatch):
@@ -683,3 +683,43 @@ def test_power_plant_is_refused_while_power_is_plentiful():
     obs["economy"].update(power_provided=200, power_drained=180)  # margin 20: a plant is due
     b._sent.clear()
     assert {"cmd": "build", "item": "powr"} in _orders(b.choose_action(_state(obs), CTX))
+
+
+def test_general_standing_raid_tops_up_the_commander():
+    army = [{"id": 100 + i, "type": "e1", "x": 26, "y": 26, "idle": True, "hp": 100} for i in range(10)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 0}))
+    b.knobs["standing_raid"] = 3
+    b.choose_action(_state(_base_obs(units=army)), CTX)
+    assert len(b._raiders) == 3
+    # Enemies at our base: the commander's 0 stands, everyone defends.
+    foes = [{"id": 900, "type": "3tnk", "x": 24, "y": 24, "hp": 100}]
+    b2 = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 0}))
+    b2.knobs["standing_raid"] = 3
+    b2.choose_action(_state(_base_obs(units=army, visible_enemies=foes)), CTX)
+    assert not b2._raiders
+
+
+def test_strategy_handler_reads_standing_raid(monkeypatch):
+    from agent import advisor
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    c = advisor.commanders_from_env(log=lambda m: None)
+    c._on_strategy({"posture": "balanced", "unit_focus": "mixed", "defenses": 1, "max_refineries": 2,
+                    "build_targets": [], "avoid": [], "standing_raid": 9, "plan": "x"})
+    assert c.knobs()["standing_raid"] == 4
+
+
+def test_carrying_on_past_an_empty_target_sticks_despite_a_stray_enemy():
+    army = [{"id": 100 + i, "type": "3tnk", "x": 60, "y": 60, "idle": True, "hp": 100} for i in range(6)]
+    stray = [{"id": 900, "type": "e1", "x": 66, "y": 60, "hp": 100}]  # one rifleman: not "something there"
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 60, "main_y": 60}))
+    b._enemy_buildings = {950: {"id": 950, "type": "powr", "x": 78, "y": 78}}
+    b.choose_action(_state(_base_obs(units=army, visible_enemies=stray)), CTX)
+    assert b._onward == (78, 78) and "carrying on" in b.status()["main_state"]
+    # The stray is shot (micro), then the army keeps heading for the power plant.
+    b._sent.clear()
+    orders = _orders(b.choose_action(_state(_base_obs(units=army)), CTX))
+    moves = [o for o in orders if o["cmd"] == "attack_move" and 100 in o["units"]]
+    assert moves and moves[-1]["to"][0] > 62
+    b._sent.clear()
+    b.choose_action(_state(_base_obs(units=army, visible_enemies=stray)), CTX)
+    assert b._onward == (78, 78)  # a stray rifleman does not reset it
