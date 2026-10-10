@@ -653,3 +653,33 @@ def test_a_blob_at_home_marches_out_together_when_told_to_attack():
     forward = {i for o in moves if o["to"][0] >= 30 and o["to"][1] >= 30 for i in o["units"]}
     assert len(forward) >= 20  # the front half heads for the enemy
     assert not any(o["to"][0] < 24 for o in moves)  # nobody is sent backwards into the base
+
+
+def test_stragglers_near_the_enemy_base_do_not_trigger_an_emergency_retreat():
+    home = [{"id": 100 + i, "type": "2tnk", "x": 26 + i % 6, "y": 26 + i // 6, "idle": True, "hp": 100} for i in range(30)]
+    straggler = [{"id": 300, "type": "e3", "x": 75, "y": 75, "idle": False, "hp": 60}]
+    foes = [{"id": 900 + i, "type": "2tnk", "x": 78, "y": 76, "hp": 100} for i in range(4)]
+    theirs = [{"id": 950, "type": "pbox", "x": 77, "y": 74, "hp": 100}]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 80}))
+    b.rules = {"2tnk": {"cost": 850}, "e3": {"cost": 300}, "pbox": {"cost": 600}}
+    b.choose_action(_state(_base_obs(units=home + straggler, visible_enemies=foes, visible_enemy_buildings=theirs)), CTX)
+    assert b._attacking and "emergency" not in b.status()["main_state"]
+    # The main body itself in a hopeless fight: retreat.
+    engaged = [{"id": 100 + i, "type": "e1", "x": 74 + i % 3, "y": 74, "idle": False, "hp": 100} for i in range(3)]
+    b2 = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 80}))
+    b2.rules = {"e1": {"cost": 100}, "2tnk": {"cost": 850}, "pbox": {"cost": 600}}
+    b2.choose_action(_state(_base_obs(units=engaged, visible_enemies=foes, visible_enemy_buildings=theirs)), CTX)
+    assert not b2._attacking and "emergency" in b2.status()["main_state"]
+
+
+def test_power_plant_is_refused_while_power_is_plentiful():
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"build": "powr"}))
+    obs = _base_obs()
+    obs["economy"].update(power_provided=400, power_drained=160)
+    d = b.choose_action(_state(obs), CTX)
+    orders = d.action["orders"] if isinstance(d, WithReasoning) else []
+    assert {"cmd": "build", "item": "powr"} not in orders
+    assert any("power margin" in p for p in b.status()["problems"])
+    obs["economy"].update(power_provided=200, power_drained=180)  # margin 20: a plant is due
+    b._sent.clear()
+    assert {"cmd": "build", "item": "powr"} in _orders(b.choose_action(_state(obs), CTX))

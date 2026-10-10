@@ -98,6 +98,7 @@ HOME_IDLE_MAX_S = 40.0      # an army waiting at home longer than this attacks i
 # decision counts for this long. Silent longer, the bot's own rules take over.
 LLM_STALE_S = 20.0
 CRUSHED = 0.4               # reflex: the main army retreats when this much weaker in its fight
+POWER_SURPLUS_REFUSE = 100  # a commanded power plant is refused while the margin is this big
 # Concentration of force ("many beat few"): fight only where we outnumber.
 SUPERIOR = 1.5              # attack at any size when this much stronger than their known army
 WAVE_EDGE = 1.2             # a full-size wave still needs this edge over their known army
@@ -634,6 +635,10 @@ class RedAlertBot:
             self._problem(f"{key} {want}: just refused by the server")
             return None
         drain = self._power(want)
+        if want in POWER and power_margin >= POWER_SURPLUS_REFUSE:
+            self._consumed.discard((d["seq"], key))  # still pending, should power drop
+            self._problem(f"{want} not built: power margin is already +{power_margin}")
+            return self._general_next(available, queued) if key == "build" else None
         if drain < 0 and power_margin + drain < 0 and want not in POWER and not any(queued[p] for p in POWER):
             power = next((p for p in POWER if p in available and not self._blocked_now(p)), None)
             if power:
@@ -1464,15 +1469,24 @@ class RedAlertBot:
         return self._cost(str(actor.get("type", "")).lower()) * max(hp, 5) / 100.0
 
     def _local_strength(self, army: list[dict], enemies: list[dict]) -> tuple[float, float]:
-        """Our army vs enemy units and defenses in the fight (within FIGHT_RADIUS of each other)."""
+        """The army's main body vs the enemy units and defenses it is fighting
+        (within FIGHT_RADIUS). The main body is what stands within
+        COHESION_REACH of the army's median position; a few stragglers next
+        to the enemy base don't make the whole army "crushed"."""
         foes = list(enemies) + [
             b for b in getattr(self, "_visible_enemy_buildings", [])
             if str(b.get("type", "")).lower() in DEFENSE_TYPES
         ]
         foes = [f for f in foes if _xy(f)]
         mine = [u for u in army if _xy(u)]
-        near_foes = [f for f in foes if any(_dist(_xy(f), _xy(u)) <= FIGHT_RADIUS for u in mine)]
-        near_mine = [u for u in mine if any(_dist(_xy(u), _xy(f)) <= FIGHT_RADIUS for f in near_foes)] or mine
+        if not mine:
+            return 0.0, 0.0
+        xs = sorted(_xy(u)[0] for u in mine)
+        ys = sorted(_xy(u)[1] for u in mine)
+        core = (xs[len(xs) // 2], ys[len(ys) // 2])
+        body = [u for u in mine if _dist(_xy(u), core) <= COHESION_REACH] or mine
+        near_foes = [f for f in foes if any(_dist(_xy(f), _xy(u)) <= FIGHT_RADIUS for u in body)]
+        near_mine = [u for u in body if any(_dist(_xy(u), _xy(f)) <= FIGHT_RADIUS for f in near_foes)] or body
         return sum(self._strength(u) for u in near_mine), sum(self._strength(f) for f in near_foes)
 
     def _raid(self, raw, army, enemies, enemy_base, staging, notes) -> list[dict]:
