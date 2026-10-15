@@ -105,6 +105,11 @@ RAID_WITHDRAW_MAX_S = 12.0  # or after this long
 RAID_RESET_S = 3.0          # a short breath (and top-up), then straight back in
 RAID_FAST = 2.0             # raid squads are units at least this fast (cells/s); infantry is 1.3
 RAID_VEHICLES = ("jeep", "ftrk", "1tnk", "apc")  # what the bot builds to fill a raid squad
+PINCER_FLANK_SHARE = 0.4    # the fastest units, up to this share of the strength, go round the back
+PINCER_HOLD = 12            # the front waits this far from the target until the flank is in place
+PINCER_BEHIND = 8           # the flank's attack position: this far past the target, seen from the front
+PINCER_SIDE = 16            # ... reached by circling this far out to one side
+PINCER_MAX_WAIT_S = 25.0    # the front stops waiting for the flank after this long
 REINFORCE_BATCH = 4         # units leave home for the front only in groups this big ...
 REINFORCE_SHARE = 0.4       # ... or this share of the front group's strength
 RAID_WITHDRAW_STEP = 16     # cells per withdraw order
@@ -266,6 +271,7 @@ class RedAlertBot:
         self._holding_since: float | None = None     # game time the main army started idling at home
         self._onward: tuple[int, int] | None = None  # where an attack carries on after clearing its target
         self._onward_for: tuple | None = None        # the commander's target that onward belongs to
+        self._pincer: dict | None = None             # the current pincer: target, flank ids, phase
         self._retreat_issued = False
         self._wave_peak = 0
         self._last_status = 0.0
@@ -437,6 +443,10 @@ class RedAlertBot:
             near = min(defs, key=lambda b: _dist(_xy(b), mc)) if mc else defs[0]
             group += (f"; known enemy defenses: {len(defs)} ({ds:.0f}), nearest {near.get('type')} at {list(_xy(near))}"
                       + (f" {_dist(_xy(near), mc):.0f} cells from our main army" if mc else ""))
+        r = self._raid_info or {}
+        if r.get("responders") and (r.get("responders_from_their_base") or 0) >= 20:
+            group += (f"; PINCER WINDOW: {r['responders']} of theirs is chasing our raid "
+                      f"{r['responders_from_their_base']} cells from their base")
         if self._raid_info:
             r = self._raid_info
             group += (f"; raid squad ({r.get('size')}): {r.get('phase')} at {r.get('at')}, responders {r.get('responders')}"
@@ -1408,6 +1418,8 @@ class RedAlertBot:
                 self._holding_since = self._game_s
         else:
             self._holding_since = None
+        if action != "pincer":
+            self._pincer = None
         if action == "attack":
             ordered = cell(d["main_x"], d["main_y"], None) or self._attack_target(enemies, force, enemy_base)
             if self._onward_for != (d["main_x"], d["main_y"]):
@@ -1449,6 +1461,13 @@ class RedAlertBot:
                                         + (notes[-1] if notes else ""))
                 else:
                     self._main_state = f"attacking {list(target)}: " + (notes[-1] if notes else "")
+        elif action == "pincer":
+            big, big_cell, _ = self.enemy_largest_group()
+            target = cell(d["main_x"], d["main_y"], None) or big_cell or self._attack_target(enemies, force, enemy_base)
+            if target and force and not self._recent("attack", 2.0):
+                orders += self._pincer_step(raw, force, enemies, tuple(target), staging, notes)
+                self._mark("attack")
+            self._attacking = True
         elif action == "hold":
             self._attacking = False
             self._onward = None
@@ -1485,6 +1504,73 @@ class RedAlertBot:
                 order = {**order, "units": ids}
             kept.append(order)
         return kept + micro
+
+    def _pincer_step(self, raw: dict, force: list[dict], enemies: list[dict], target, staging,
+                     notes: list[str]) -> list[dict]:
+        """Front and back: the fastest units circle round to the far side of
+        the target while the rest close to PINCER_HOLD cells in front and wait;
+        when the flank is in place (or after PINCER_MAX_WAIT_S) both hit at once."""
+        now = time.monotonic()
+        alive = {u["id"]: u for u in force if _xy(u)}
+        p = self._pincer
+        if p is None or _dist(p["target"], target) > 6 or not (set(p["flank"]) & set(alive)):
+            total = sum(self._strength(u) for u in alive.values()) or 1.0
+            flank, s = [], 0.0
+            for u in sorted(alive.values(), key=self._speed, reverse=True):
+                if len(alive) - len(flank) <= 2 or (s >= PINCER_FLANK_SHARE * total and len(flank) >= 2):
+                    break
+                if len(flank) >= 2 and self._speed(u) < 0.8 * self._speed(alive[flank[0]]):
+                    break  # a slow unit would hold the flank back: it stays with the front
+                flank.append(u["id"])
+                s += self._strength(u)
+            front_ids = [i for i in alive if i not in flank]
+            centre = self._centroid([_xy(alive[i]) for i in front_ids]) or self._centroid([_xy(u) for u in alive.values()])
+            d = _dist(centre, target) or 1.0
+            ux, uy = (target[0] - centre[0]) / d, (target[1] - centre[1]) / d
+            behind = self._clamp((int(round(target[0] + ux * PINCER_BEHIND)), int(round(target[1] + uy * PINCER_BEHIND))), raw)
+            # Circle out on the quieter side (fewer remembered enemies).
+            options = {}
+            for side in (1, -1):
+                px, py = -uy * side, ux * side
+                wp = self._clamp((int(round(target[0] - ux * 4 + px * PINCER_SIDE)),
+                                  int(round(target[1] - uy * 4 + py * PINCER_SIDE))), raw)
+                danger = sum(self._strength(e) for e in self._enemy_army.values() if _dist((e["x"], e["y"]), wp) <= 12)
+                options[side] = (danger, wp)
+            side = min(options, key=lambda k: options[k][0])
+            hold = self._clamp((int(round(target[0] - ux * PINCER_HOLD)), int(round(target[1] - uy * PINCER_HOLD))), raw)
+            p = self._pincer = {"target": tuple(target), "flank": flank, "side_wp": options[side][1],
+                                "behind": behind, "hold": hold, "phase": "flanking", "since": now, "leg": 0}
+            self.log(f"[bot] pincer on {list(target)}: {len(flank)} flank via {list(options[side][1])} to "
+                     f"{list(behind)}, {len(front_ids)} hold at {list(hold)}")
+        flank = [alive[i] for i in p["flank"] if i in alive]
+        front = [u for i, u in alive.items() if i not in p["flank"]]
+        fc = self._centroid([_xy(u) for u in flank]) if flank else None
+        if p["phase"] == "flanking":
+            if fc and p["leg"] == 0 and _dist(fc, p["side_wp"]) <= 5:
+                p["leg"] = 1
+            in_place = fc is not None and p["leg"] == 1 and _dist(fc, p["behind"]) <= 5
+            contact = fc is not None and any(_dist(_xy(e), fc) <= 6 for e in enemies if _xy(e) and self._is_combat(e))
+            if in_place or contact or now - p["since"] > PINCER_MAX_WAIT_S or not flank:
+                p["phase"] = "closing"
+                self.log(f"[bot] pincer closing on {list(p['target'])} "
+                         f"({'flank in place' if in_place else 'flank engaged' if contact else 'timeout'})")
+        orders: list[dict] = []
+        if p["phase"] == "flanking":
+            if flank:
+                wp = p["side_wp"] if p["leg"] == 0 else p["behind"]
+                orders.append({"cmd": "move", "units": [u["id"] for u in flank], "to": list(wp)})
+            if front:
+                orders.append({"cmd": "attack_move", "units": [u["id"] for u in front], "to": list(p["hold"])})
+            why = (f"pincer: flank ({len(flank)}) circling to {list(p['behind'])}, "
+                   f"front ({len(front)}) waiting at {list(p['hold'])}")
+        else:
+            ids = [u["id"] for u in flank + front]
+            for chunk in _chunks(ids, 50):
+                orders.append({"cmd": "attack_move", "units": chunk, "to": list(p["target"])})
+            why = f"pincer closing: front and back on {list(p['target'])}"
+        self._main_state = why
+        notes.append(why)
+        return orders
 
     def _should_launch(self, army: list[dict], size: int, wave_size: int, remaining) -> tuple[bool, str]:
         """Many beat few: go when clearly stronger than the enemy army we know of,

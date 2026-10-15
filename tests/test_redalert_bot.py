@@ -859,3 +859,33 @@ def test_focus_fire_stays_on_one_target_until_it_dies():
     orders = _orders(b.choose_action(_state(_base_obs(units=army, visible_enemies=foes2)), CTX))
     assert b._focus_id == first
     assert all(o["target"] == first for o in orders if o["cmd"] == "attack" and set(o["units"]) & {100, 101, 102})
+
+
+def test_pincer_flanks_round_the_back_then_closes():
+    from agent import redalert_bot as rb
+    army = [{"id": 100 + i, "type": "3tnk", "x": 30, "y": 50, "idle": True, "hp": 100} for i in range(5)]
+    army += [{"id": 200 + i, "type": "1tnk", "x": 30, "y": 50, "idle": True, "hp": 100} for i in range(3)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "pincer", "main_x": 60, "main_y": 50}))
+    b.rules = {"3tnk": {"cost": 1150, "speed": 1.56}, "1tnk": {"cost": 700, "speed": 2.76}}
+    orders = _orders(b.choose_action(_state(_base_obs(units=army)), CTX))
+    p = b._pincer
+    assert set(p["flank"]) == {200, 201, 202}  # the fast tanks go round
+    assert p["behind"][0] > 60  # behind the target, seen from us
+    flank_move = [o for o in orders if o["cmd"] == "move" and set(o["units"]) == {200, 201, 202}]
+    assert flank_move and abs(flank_move[0]["to"][1] - 50) >= 10  # out to a side first
+    front = [o for o in orders if o["cmd"] == "attack_move" and set(o["units"]) >= {100, 101}]
+    assert front and front[0]["to"][0] < 60  # the front waits short of the target
+    assert "pincer" in b.status()["main_state"]
+    # Flank at the behind point: both close in.
+    b._pincer["leg"] = 1
+    moved = [{**u, "x": p["behind"][0], "y": p["behind"][1]} if u["id"] >= 200 else u for u in army]
+    b._sent.clear()
+    orders = _orders(b.choose_action(_state(_base_obs(units=moved)), CTX))
+    assert b._pincer["phase"] == "closing"
+    assert any(o["cmd"] == "attack_move" and o["to"] == [60, 50] and {100, 200} <= set(o["units"]) for o in orders)
+
+
+def test_pincer_window_is_flagged():
+    b = bot()
+    b._raid_info = {"size": 3, "phase": "withdraw", "at": [40, 40], "responders": 1800, "responders_from_their_base": 26}
+    assert "PINCER WINDOW" in b._situation()
