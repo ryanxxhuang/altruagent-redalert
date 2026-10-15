@@ -104,6 +104,9 @@ RAID_NOT_CHASED_S = 2.0     # ... or none has come closer for this long (they st
 RAID_WITHDRAW_MAX_S = 12.0  # or after this long
 RAID_RESET_S = 3.0          # a short breath (and top-up), then straight back in
 RAID_FAST = 2.0             # raid squads are units at least this fast (cells/s); infantry is 1.3
+RAID_VEHICLES = ("jeep", "ftrk", "1tnk", "apc")  # what the bot builds to fill a raid squad
+REINFORCE_BATCH = 4         # units leave home for the front only in groups this big ...
+REINFORCE_SHARE = 0.4       # ... or this share of the front group's strength
 RAID_WITHDRAW_STEP = 16     # cells per withdraw order
 RAID_TARGET_VALUE = {"harv": 10.0, "mcv": 8.0, "arty": 6.0, "v2rl": 6.0, "e1": 1.5, "e3": 1.2, "e6": 2.0,
                      "medi": 2.0, "jeep": 1.0, "ftrk": 0.8, "apc": 0.6}
@@ -427,6 +430,13 @@ class RedAlertBot:
                 f", {_dist(cell, ob):.0f} from our base" if ob else "") + (
                 f", {_dist(cell, mc):.0f} from our main army" if mc else "")
             group = f"; largest enemy group seen: {big:.0f} at {list(cell)} {age:.0f}s ago{where}"
+        defs = self.enemy_defenses()
+        if defs:
+            ds = sum(self._strength(b) for b in defs)
+            mc = getattr(self, "_main_centre", None)
+            near = min(defs, key=lambda b: _dist(_xy(b), mc)) if mc else defs[0]
+            group += (f"; known enemy defenses: {len(defs)} ({ds:.0f}), nearest {near.get('type')} at {list(_xy(near))}"
+                      + (f" {_dist(_xy(near), mc):.0f} cells from our main army" if mc else ""))
         if self._raid_info:
             r = self._raid_info
             group += (f"; raid squad ({r.get('size')}): {r.get('phase')} at {r.get('at')}, responders {r.get('responders')}"
@@ -768,7 +778,19 @@ class RedAlertBot:
                starving: bool = False, d: dict | None = None) -> list[dict]:
         orders: list[dict] = []
         handled: set[str] = set()
-        # The commander's choices: each queue keeps producing what it said.
+        # The commander's raid squad needs fast vehicles: build them first.
+        if d and d.get("raid_size", 0) >= 2 and "Vehicle" not in busy and not self._recent("vehicle", 0.8):
+            fast_owned = sum(1 for u in army if self._speed(u) >= RAID_FAST) + sum(
+                queued[v] for v in RAID_VEHICLES)
+            if fast_owned < d["raid_size"]:
+                want = str(d.get("raid_unit") or "").lower()
+                options = ([want] if want in RAID_VEHICLES else []) + list(RAID_VEHICLES)
+                item = next((v for v in options if v in available and not self._blocked_now(v)), None)
+                if item:
+                    orders.append({"cmd": "train", "item": item, "count": 1})
+                    self._mark("vehicle")
+                    busy = busy | {"Vehicle"}
+                    notes.append(f"training {item} for the raid squad")
         if d:
             for queue, key in (("Vehicle", "vehicle"), ("Infantry", "infantry")):
                 want = d.get(key, "auto")
@@ -935,8 +957,13 @@ class RedAlertBot:
             target = next((e for e in enemies if e.get("id") == focus.get("target")), None)
         if target is None:
             self._focus = None
-            if fighting:
+            # Focus fire: keep shooting the same unit until it dies or leaves the
+            # fight; switching targets spreads the damage and kills nothing.
+            last = getattr(self, "_focus_id", None)
+            target = next((e for e in fighting if e.get("id") == last), None)
+            if target is None and fighting:
                 target = max(fighting, key=self._target_score)
+        self._focus_id = target.get("id") if target else None
         tcell = _xy(target) if target else None
         if not tcell or not isinstance(target.get("id"), int):
             # No enemy units in the fight: wreck their buildings in the right order.
@@ -1080,6 +1107,11 @@ class RedAlertBot:
             if strength > best:
                 best, cell, age = strength, (e["x"], e["y"]), now - max(f["t"] for f in group)
         return best, cell, age
+
+    def enemy_defenses(self) -> list[dict]:
+        """Enemy defenses we have seen (pillboxes, turrets, tesla coils...)."""
+        return [b for b in self._enemy_buildings.values()
+                if _xy(b) and str(b.get("type", "")).lower() in DEFENSE_TYPES]
 
     def enemy_army_estimate(self) -> tuple[float, bool]:
         """(strength of the enemy army we know of, whether we've seen it lately)."""
@@ -1303,6 +1335,8 @@ class RedAlertBot:
         # standing raid (unless enemies are at our base and everyone is needed).
         before = set(self._raiders)
         size = d["raid_size"]
+        if size >= 2:
+            self._raiders = {i for i in self._raiders if self._speed(alive[i]) >= RAID_FAST}
         standing = int(self.knobs.get("standing_raid", 0) or 0)
         if standing > size and self._threat <= 0 and len(alive) >= standing + 4:
             size = standing
@@ -1323,17 +1357,22 @@ class RedAlertBot:
                 return not any(_xy(e) and _dist(_xy(e), _xy(u)) <= 10 for e in enemies if self._is_combat(e))
             spare = [u for i, u in alive.items() if i not in self._raiders and free(u)]
             want = str(d.get("raid_unit") or "").lower()
-            if want and size >= 2 and DEFAULT_SPEED.get(want, 2.0) < RAID_FAST \
-                    and any(self._speed(u) >= RAID_FAST for u in spare):
-                self._problem(f"raid_unit {want} is too slow to hit and run; using fast units instead")
-                want = ""
+            scout = size == 1 and want in ("", "e1")
+            if not scout:
+                # Raids are fast vehicles only: infantry can't run and dies.
+                if want and DEFAULT_SPEED.get(want, self._speed({"type": want})) < RAID_FAST:
+                    self._problem(f"raid_unit {want} is too slow to hit and run; raids use jeep/ftrk/1tnk/apc")
+                    want = ""
+                spare = [u for u in spare if self._speed(u) >= RAID_FAST]
+                if not spare:
+                    self._problem("no fast units for the raid squad yet; the bot is building raid vehicles")
             if want:
                 typed = [u for u in spare if str(u.get("type", "")).lower() == want]
                 if not typed and spare:
                     self._problem(f"raid_unit {want}: none idle, using the fastest units instead")
                 spare = typed or spare
             self._raid_side = None
-            if size == 1 and not want:
+            if scout:
                 # A squad of one is a scout: the cheapest unit, never a tank.
                 spare.sort(key=lambda u: self._cost(str(u.get("type", "")).lower()))
             else:
@@ -1496,13 +1535,17 @@ class RedAlertBot:
         s_reach = sum(self._strength(u) for u in mine if _dist(_xy(u), core) <= COHESION_REACH) or 1.0
         s_core = sum(self._strength(u) for u in near)
         orders: list[dict] = []
-        for chunk in _chunks([u["id"] for u in far], max_units):
+        # Many beat few: units at home leave for the front only as a group;
+        # units already on the way keep going to it.
+        at_home = [u for u in far if staging and _dist(_xy(u), staging) <= 8]
+        en_route = [u for u in far if u not in at_home]
+        batch = sum(self._strength(u) for u in at_home)
+        joiners = en_route + (at_home if len(at_home) >= REINFORCE_BATCH
+                              or batch >= REINFORCE_SHARE * max(1.0, sum(self._strength(u) for u in front)) else [])
+        for chunk in _chunks([u["id"] for u in joiners], max_units):
             orders.append({"cmd": "attack_move", "units": chunk, "to": list(core)})
 
-        foes = [e for e in enemies if _xy(e)] + [
-            b for b in getattr(self, "_visible_enemy_buildings", [])
-            if str(b.get("type", "")).lower() in DEFENSE_TYPES and _xy(b)
-        ]
+        foes = [e for e in enemies if _xy(e)] + self.enemy_defenses()
         nxt = target if _dist(core, target) <= LEG else self._toward(core, target, LEG, raw)
         ahead = sum(self._strength(f) for f in foes if _dist(_xy(f), nxt) <= 10 or _dist(_xy(f), core) <= 8)
         self._ahead = ahead

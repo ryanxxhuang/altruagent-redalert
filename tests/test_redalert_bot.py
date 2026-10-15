@@ -414,6 +414,7 @@ def test_commander_unknown_item_is_reported_back():
 
 def test_commander_attack_retreat_and_raid():
     army = [{"id": 100 + i, "type": "3tnk", "x": 30, "y": 30, "idle": True, "hp": 100} for i in range(6)]
+    army += [{"id": 150 + i, "type": "jeep", "x": 30, "y": 30, "idle": True, "hp": 100} for i in range(2)]
     b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 70, "main_y": 70,
                                                                 "raid_size": 2, "raid_x": 60, "raid_y": 20}))
     orders = _orders(b.choose_action(_state(_base_obs(units=army)), CTX))
@@ -604,7 +605,7 @@ def test_scout_is_the_cheapest_unit_and_raid_unit_is_honoured():
 
 
 def test_outgunned_raid_withdraws_instead_of_fighting():
-    units = [{"id": 100 + i, "type": "e1", "x": 60, "y": 60, "idle": True, "hp": 100} for i in range(3)]
+    units = [{"id": 100 + i, "type": "jeep", "x": 60, "y": 60, "idle": True, "hp": 100} for i in range(3)]
     foes = [{"id": 900 + i, "type": "3tnk", "x": 62, "y": 60, "hp": 100} for i in range(4)]
     b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 2, "raid_x": 80, "raid_y": 60}))
     b.choose_action(_state(_base_obs(units=units)), CTX)   # squad formed
@@ -683,7 +684,8 @@ def test_power_plant_is_refused_while_power_is_plentiful():
 
 
 def test_general_standing_raid_tops_up_the_commander():
-    army = [{"id": 100 + i, "type": "e1", "x": 26, "y": 26, "idle": True, "hp": 100} for i in range(10)]
+    army = [{"id": 100 + i, "type": "e1", "x": 26, "y": 26, "idle": True, "hp": 100} for i in range(7)]
+    army += [{"id": 150 + i, "type": "jeep", "x": 26, "y": 26, "idle": True, "hp": 100} for i in range(3)]
     b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 0}))
     b.knobs["standing_raid"] = 3
     b.choose_action(_state(_base_obs(units=army)), CTX)
@@ -818,3 +820,42 @@ def test_raid_squad_takes_moving_units_not_only_idle_ones():
     b.rules = {"jeep": {"cost": 500, "speed": 4.0}, "e3": {"cost": 300, "speed": 1.32}}
     b.choose_action(_state(_base_obs(units=units)), CTX)
     assert 200 in b._raiders
+
+
+def test_raids_never_use_infantry_and_jeeps_get_built():
+    units = [{"id": 100 + i, "type": "e3", "x": 40, "y": 40, "idle": True, "hp": 100} for i in range(6)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 2, "raid_unit": "jeep", "vehicle": "3tnk"}))
+    b.rules = {"jeep": {"cost": 500, "speed": 4.0}, "e3": {"cost": 300, "speed": 1.32}, "3tnk": {"cost": 1150, "speed": 1.56}}
+    obs = _base_obs(units=units)
+    obs["available_production"] = obs["available_production"] + ["jeep"]
+    orders = _orders(b.choose_action(_state(obs), CTX))
+    assert not b._raiders  # no infantry raid
+    assert {"cmd": "train", "item": "jeep", "count": 1} in orders  # jeeps first, then the tanks
+    assert any("fast units" in p for p in b.status()["problems"])
+
+
+def test_reinforcements_wait_at_home_until_a_group_can_leave():
+    front = [{"id": 100 + i, "type": "3tnk", "x": 70, "y": 70, "idle": True, "hp": 100} for i in range(6)]
+    one = [{"id": 300, "type": "e3", "x": 27, "y": 27, "idle": True, "hp": 100}]  # staging is near (27, 27)
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 80}))
+    b.rules = {"3tnk": {"cost": 1150}, "e3": {"cost": 300}}
+    orders = _orders(b.choose_action(_state(_base_obs(units=front + one)), CTX))
+    assert not any(300 in o.get("units", []) for o in orders if o["cmd"] == "attack_move")  # waits
+    group = [{"id": 300 + i, "type": "3tnk", "x": 27, "y": 27, "idle": True, "hp": 100} for i in range(4)]
+    b._sent.clear()
+    orders = _orders(b.choose_action(_state(_base_obs(units=front + group)), CTX))
+    assert any({300, 301, 302, 303} <= set(o.get("units", [])) for o in orders if o["cmd"] == "attack_move")
+
+
+def test_focus_fire_stays_on_one_target_until_it_dies():
+    army = [{"id": 100 + i, "type": "3tnk", "x": 50, "y": 50, "idle": False, "hp": 100} for i in range(5)]
+    foes = [{"id": 900, "type": "2tnk", "x": 54, "y": 50, "hp": 90}, {"id": 901, "type": "2tnk", "x": 55, "y": 51, "hp": 100}]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 50}))
+    b.choose_action(_state(_base_obs(units=army, visible_enemies=foes)), CTX)
+    first = b._focus_id
+    # The other one is now weaker, but we keep killing the first.
+    foes2 = [{**foes[0], "hp": 60}, {**foes[1], "hp": 20}] if first == 900 else [{**foes[0], "hp": 20}, {**foes[1], "hp": 60}]
+    b._sent.clear()
+    orders = _orders(b.choose_action(_state(_base_obs(units=army, visible_enemies=foes2)), CTX))
+    assert b._focus_id == first
+    assert all(o["target"] == first for o in orders if o["cmd"] == "attack" and set(o["units"]) & {100, 101, 102})
