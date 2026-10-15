@@ -120,6 +120,9 @@ PINCER_HOLD = 12            # the front waits this far from the target until the
 PINCER_BEHIND = 8           # the flank's attack position: this far past the target, seen from the front
 PINCER_SIDE = 16            # ... reached by circling this far out to one side
 PINCER_MAX_WAIT_S = 25.0    # the front stops waiting for the flank after this long
+PINCER_RETARGET = 10        # a target that moved less than this updates the plan instead of restarting it
+PINCER_MIN_FLANK = 0.2      # no flank worth less than this share of the army: a pincer becomes a plain attack
+RAID_FLOOR = 2              # with this many fast vehicles free, a raid squad is always out
 REINFORCE_BATCH = 4         # units leave home for the front only in groups this big ...
 REINFORCE_SHARE = 0.4       # ... or this share of the front group's strength
 RAID_WITHDRAW_STEP = 16     # cells per withdraw order
@@ -604,6 +607,12 @@ class RedAlertBot:
             else:
                 self._prod_seen[item] = [now, now]
         self._catalog = {i: [self._cost(i), self._queue_of(i)] for i in sorted(available)}
+        for p in production:
+            q = p.get("queue")
+            for i, rule in self.rules.items():
+                if rule.get("queue") == q and i not in self._catalog and i in getattr(self, "_ever_available", set()):
+                    self._catalog[i] = [self._cost(i), f"{q} (queue busy)"]
+        self._ever_available = getattr(self, "_ever_available", set()) | set(available)
         d = self._llm()
 
         # 3. Build order (Building queue: one at a time).
@@ -711,7 +720,9 @@ class RedAlertBot:
         if (started is not None and asked < started + 1.0) or (seen and seen[0] <= asked <= seen[1] + 1.5):
             return self._general_next(available, queued) if key == "build" else None
         if want not in available:
-            self._problem(f"{key} {want}: not available now")
+            if want in self.rules or want in DEFAULT_COST:
+                return self._general_next(available, queued) if key == "build" else None  # queue busy: later
+            self._problem(f"{key} {want}: not in our tech yet (see catalog)")
             return None
         if self._blocked_now(want):
             self._problem(f"{key} {want}: just refused by the server")
@@ -844,7 +855,10 @@ class RedAlertBot:
                 if not item:
                     continue
                 if item not in available or self._blocked_now(item):
-                    self._problem(f"{key} {item}: not available now")
+                    if item in self.rules or item in DEFAULT_COST:
+                        # Unlocked, just not offered this moment (its queue is busy): try next tick.
+                        continue
+                    self._problem(f"{key} {item}: not in our tech yet (see catalog)")
                     continue
                 count = 1 if item == "harv" else int(d.get(f"{key}_count", 1))
                 orders.append({"cmd": "train", "item": item, "count": count})
@@ -1413,8 +1427,13 @@ class RedAlertBot:
         if size >= 2:
             self._raiders = {i for i in self._raiders if self._speed(alive[i]) >= RAID_FAST}
         standing = int(self.knobs.get("standing_raid", 0) or 0)
-        if standing > size and self._threat <= 0 and len(alive) >= standing + 4:
-            size = standing
+        fast_free = sum(1 for i, u in alive.items() if self._speed(u) >= RAID_FAST and i not in self._apc_ids())
+        floor = min(RAID_FLOOR, fast_free) if fast_free >= RAID_FLOOR else 0
+        if not apc_mode and self._threat <= 0:
+            if standing > size and len(alive) >= standing + 4:
+                size = standing
+            if floor > size and d["raid_size"] <= 0:
+                size = floor  # fast vehicles never sit at home: raids run all game
         if size <= 0 and self._raiders:
             if staging:
                 orders.append({"cmd": "move", "units": sorted(self._raiders)[:max_units], "to": list(staging)})
@@ -1487,8 +1506,10 @@ class RedAlertBot:
                 self._holding_since = self._game_s
         else:
             self._holding_since = None
-        if action != "pincer":
+        if action in ("retreat", "defend") or (action == "attack" and self._pincer and _dist(self._pincer["target"], cell(d["main_x"], d["main_y"], self._pincer["target"])) > PINCER_RETARGET):
             self._pincer = None
+        if action == "hold" and self._pincer and self._pincer["phase"] == "closing":
+            action = "pincer"  # a closing pincer finishes; "hold" doesn't stop it mid-fight
         if action == "attack":
             ordered = cell(d["main_x"], d["main_y"], None) or self._attack_target(enemies, force, enemy_base)
             if self._onward_for != (d["main_x"], d["main_y"]):
@@ -1594,7 +1615,19 @@ class RedAlertBot:
             return None
         ratio = ours_s / theirs_s
         ec = self._centroid([_xy(e) for e in near])
-        if ratio >= SURROUND_RATIO:
+        cover = self._covered_by_defense(ec, margin=SURROUND_RADIUS + 1)
+        if ratio >= SURROUND_RATIO and cover is not None:
+            # Their group sits under a defense: no ring under fire. Hold at the
+            # edge of its reach and shoot what comes out; siege deals with the tower.
+            if self._recent("doctrine", 1.5):
+                return []
+            self._mark("doctrine")
+            edge = self._out_of_reach(centre, raw)
+            ids = [u["id"] for u in body]
+            orders = [{"cmd": "attack_move", "units": chunk, "to": list(edge)} for chunk in _chunks(ids, 50)]
+            mode = (f"many vs few ({ratio:.1f}x) but under their {cover.get('type')} at {list(_xy(cover))}: "
+                    f"holding at the edge of its reach, not chasing in")
+        elif ratio >= SURROUND_RATIO:
             if self._recent("doctrine", 1.5):
                 return []
             self._mark("doctrine")
@@ -1624,8 +1657,11 @@ class RedAlertBot:
                 orders = [{"cmd": "move", "units": chunk, "to": list(dest)} for chunk in _chunks(ids, 50)]
                 mode = f"few vs many ({ratio:.1f}x): backing off while they come on"
             else:
-                orders = [{"cmd": "attack_move", "units": chunk, "to": list(ec)} for chunk in _chunks(ids, 50)]
-                mode = f"few vs many ({ratio:.1f}x): they stopped, hitting back"
+                # They stopped: shoot from where we stand (micro picks targets);
+                # never walk forward into the bigger force.
+                here = self._out_of_reach(centre, raw)
+                orders = [{"cmd": "attack_move", "units": chunk, "to": list(here)} for chunk in _chunks(ids, 50)]
+                mode = f"few vs many ({ratio:.1f}x): they stopped, holding ground and shooting what comes"
         else:
             self._fight_mode = None
             return None
@@ -1644,7 +1680,9 @@ class RedAlertBot:
         now = time.monotonic()
         alive = {u["id"]: u for u in force if _xy(u)}
         p = self._pincer
-        if p is None or _dist(p["target"], target) > 6 or not (set(p["flank"]) & set(alive)):
+        if p is not None and 0 < _dist(p["target"], target) <= PINCER_RETARGET and p["phase"] == "flanking":
+            p["target"] = tuple(target)  # the group shifted a little: same plan, updated target
+        if p is None or _dist(p["target"], target) > PINCER_RETARGET or not (set(p["flank"]) & set(alive)):
             total = sum(self._strength(u) for u in alive.values()) or 1.0
             flank, s = [], 0.0
             for u in sorted(alive.values(), key=self._speed, reverse=True):
@@ -1654,6 +1692,12 @@ class RedAlertBot:
                     break  # a slow unit would hold the flank back: it stays with the front
                 flank.append(u["id"])
                 s += self._strength(u)
+            if s < PINCER_MIN_FLANK * total or len(flank) < 2:
+                # Not enough fast units for a flank worth the name: attack as one.
+                self._pincer = None
+                notes.append(f"pincer: no flank worth sending ({len(flank)} fast units), attacking as one group")
+                self._problem("pincer: too few fast units for a flank; attacking as one group (build jeeps/flak trucks/APCs)")
+                return self._advance(raw, force, enemies, target, staging, notes, give_up=False, obey=True)
             front_ids = [i for i in alive if i not in flank]
             centre = self._centroid([_xy(alive[i]) for i in front_ids]) or self._centroid([_xy(u) for u in alive.values()])
             d = _dist(centre, target) or 1.0
@@ -1775,11 +1819,15 @@ class RedAlertBot:
             dest, why = nxt, f"in contact, pressing on ({s_core:.0f} vs {ahead:.0f} ahead)"
             self._held_since = None
         elif at_home or grouped:
-            if obey or s_core >= AHEAD_EDGE * ahead:
+            if s_core >= AHEAD_EDGE * ahead or (obey and ahead < DOCTRINE_MIN):
                 dest, why = nxt, f"advancing ({s_core:.0f} vs {ahead:.0f} ahead)"
                 self._held_since = None
             else:
-                dest, why = core, f"outnumbered ahead ({s_core:.0f} vs {ahead:.0f}), waiting for reinforcements"
+                # Few vs many: nobody walks into a stronger force, whoever ordered
+                # it. Hold here, out of their reach, and let the commander bring
+                # more, pincer, siege or raid elsewhere.
+                dest = self._out_of_reach(core, raw)
+                why = f"outnumbered ahead ({s_core:.0f} vs {ahead:.0f}): holding out of their reach, not charging"
                 if self._held_since is None:
                     self._held_since = self._game_s
                 elif give_up and self._game_s - self._held_since > HOLD_GIVE_UP_S:
@@ -1800,6 +1848,18 @@ class RedAlertBot:
             self.log(f"[bot] army: {why}; front at {list(core)}, {len(far)} joining, next step {list(dest)}")
         return orders
 
+    def _out_of_reach(self, cell, raw: dict) -> tuple[int, int]:
+        """``cell`` itself, or a cell stepped back out of the reach of any known
+        defense that covers it."""
+        b = self._covered_by_defense(cell, margin=1.0)
+        if not b:
+            return cell
+        bc = _xy(b)
+        d = _dist(cell, bc) or 1.0
+        need = self._defense_reach(b) + 2.0
+        return self._clamp((int(round(bc[0] + (cell[0] - bc[0]) / d * need)),
+                            int(round(bc[1] + (cell[1] - bc[1]) / d * need))), raw)
+
     def _move_home(self, ids: list[int], staging, max_units: int) -> list[dict]:
         if not staging or not ids:
             return []
@@ -1816,11 +1876,7 @@ class RedAlertBot:
         (within FIGHT_RADIUS). The main body is what stands within
         COHESION_REACH of the army's median position; a few stragglers next
         to the enemy base don't make the whole army "crushed"."""
-        foes = list(enemies) + [
-            b for b in getattr(self, "_visible_enemy_buildings", [])
-            if str(b.get("type", "")).lower() in DEFENSE_TYPES
-        ]
-        foes = [f for f in foes if _xy(f)]
+        foes = [e for e in enemies if _xy(e)] + [b for b in self.enemy_defenses() if self._defense_reach(b) > 0]
         mine = [u for u in army if _xy(u)]
         if not mine:
             return 0.0, 0.0

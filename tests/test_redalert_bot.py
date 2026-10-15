@@ -865,8 +865,9 @@ def test_pincer_flanks_round_the_back_then_closes():
     from agent import redalert_bot as rb
     army = [{"id": 100 + i, "type": "3tnk", "x": 30, "y": 50, "idle": True, "hp": 100} for i in range(5)]
     army += [{"id": 200 + i, "type": "1tnk", "x": 30, "y": 50, "idle": True, "hp": 100} for i in range(3)]
+    army += [{"id": 300 + i, "type": "jeep", "x": 27, "y": 27, "idle": True, "hp": 100} for i in range(2)]  # the standing raid
     b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "pincer", "main_x": 60, "main_y": 50}))
-    b.rules = {"3tnk": {"cost": 1150, "speed": 1.56}, "1tnk": {"cost": 700, "speed": 2.76}}
+    b.rules = {"3tnk": {"cost": 1150, "speed": 1.56}, "1tnk": {"cost": 700, "speed": 2.76}, "jeep": {"cost": 500, "speed": 4.0}}
     orders = _orders(b.choose_action(_state(_base_obs(units=army)), CTX))
     p = b._pincer
     assert set(p["flank"]) == {200, 201, 202}  # the fast tanks go round
@@ -878,7 +879,7 @@ def test_pincer_flanks_round_the_back_then_closes():
     assert "pincer" in b.status()["main_state"]
     # Flank at the behind point: both close in.
     b._pincer["leg"] = 1
-    moved = [{**u, "x": p["behind"][0], "y": p["behind"][1]} if u["id"] >= 200 else u for u in army]
+    moved = [{**u, "x": p["behind"][0], "y": p["behind"][1]} if 200 <= u["id"] < 300 else u for u in army]
     b._sent.clear()
     orders = _orders(b.choose_action(_state(_base_obs(units=moved)), CTX))
     assert b._pincer["phase"] == "closing"
@@ -919,7 +920,7 @@ def test_few_vs_many_backs_off_then_hits_back():
     b._enemy_hist = {}
     b._sent.clear()
     orders = _orders(b.choose_action(_state(_base_obs(units=army, visible_enemies=foes)), CTX))
-    assert "hitting back" in b.status()["main_state"]
+    assert "holding ground" in b.status()["main_state"]
 
 
 def test_unopposed_raid_finishes_the_harvester():
@@ -1008,3 +1009,23 @@ def test_apc_raid_loads_drops_and_leaves():
     b._sent.clear()
     b.choose_action(_state(_base_obs(units=[{**apc, "x": 66, "y": 66}], visible_enemies=tanks)), CTX)
     assert b._apc["phase"] == "home"
+
+
+def test_army_never_charges_a_stronger_force_ahead():
+    army = [{"id": 100 + i, "type": "3tnk", "x": 50, "y": 50, "idle": True, "hp": 100} for i in range(5)]  # 5,750
+    foes = [{"id": 900 + i, "type": "3tnk", "x": 64, "y": 50, "hp": 100} for i in range(7)]               # 8,050 ahead
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 50}))
+    b.rules = {"3tnk": {"cost": 1150, "speed": 1.56}}
+    orders = _orders(b.choose_action(_state(_base_obs(units=army, visible_enemies=foes)), CTX))
+    assert "outnumbered ahead" in b.status()["main_state"]
+    assert not any(o["cmd"] == "attack_move" and o["to"][0] > 52 for o in orders)  # nobody walks forward
+
+
+def test_no_surrounding_under_an_enemy_defense():
+    army = [{"id": 100 + i, "type": "3tnk", "x": 50, "y": 50, "idle": False, "hp": 100} for i in range(8)]
+    foes = [{"id": 900, "type": "e3", "x": 56, "y": 50, "hp": 100}]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 50}))
+    b.rules = {"3tnk": {"cost": 1150, "speed": 1.56}, "e3": {"cost": 300}, "tsla": {"cost": 1200}}
+    b._enemy_buildings = {950: {"id": 950, "type": "tsla", "x": 59, "y": 50}}
+    b.choose_action(_state(_base_obs(units=army, visible_enemies=foes)), CTX)
+    assert "under their tsla" in b.status()["main_state"]

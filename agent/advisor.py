@@ -26,6 +26,7 @@ The key is never printed or logged.
 from __future__ import annotations
 
 import json
+from collections import deque
 import os
 import threading
 import time
@@ -310,6 +311,7 @@ class Commanders:
         self._tactical_note = ""
         self._decision: dict | None = None
         self._seq = 0
+        self._recent_decisions: deque = deque(maxlen=5)
 
     # -- read by the bot -------------------------------------------------------------
 
@@ -342,6 +344,9 @@ class Commanders:
             asked = time.monotonic()
             tactical.run(
                 {"situation": (bot_status or {}).get("situation"),
+                 "your_recent_decisions": [
+                     {k: v for k, v in dd.items() if k in ("main_action", "main_x", "main_y", "raid_size", "build", "vehicle")}
+                     for dd in list(self._recent_decisions)[-3:]],
                  "general_standing_raid": self._knobs.get("standing_raid", 0),
                  "strategic_plan": self._plan, "general_build_targets": self._knobs.get("build_targets"),
                  "general_avoid": self._knobs.get("avoid"), "your_last_note": self._tactical_note,
@@ -412,6 +417,7 @@ class Commanders:
             "raid_y": num("raid_y", -1, 500, -1),
         }
         self._tactical_note = str(a.get("note", ""))[:200]
+        self._recent_decisions.append(decision)
         with self._lock:
             self._seq += 1
             self._decision = {**decision, "seq": self._seq, "t": time.monotonic(),
