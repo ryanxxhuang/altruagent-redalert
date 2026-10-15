@@ -121,6 +121,15 @@ HOME_IDLE_MAX_S = 40.0      # an army waiting at home longer than this attacks i
 # decision counts for this long. Silent longer, the bot's own rules take over.
 LLM_STALE_S = 20.0
 CRUSHED = 0.4               # reflex: the main army retreats when this much weaker in its fight
+# The doctrine, applied to every fight by reflex:
+#   many vs few  (>= SURROUND_RATIO): surround them and annihilate (encircle, focus fire, chase)
+#   few vs many  (<  HARASS_RATIO):   hit and run (back off while they come on, shoot when they stop)
+SURROUND_RATIO = 1.5
+HARASS_RATIO = 0.8
+SURROUND_RADIUS = 4         # ring around their group the surrounding units close onto
+DOCTRINE_MIN = 300          # smaller enemy forces are shot on the move, not surrounded
+HARASS_STEP = 6             # cells the group backs off while they come on
+RAID_STRIKE_MAX_S = 20.0    # an unopposed raid keeps hitting a target this long to finish it
 POWER_SURPLUS_REFUSE = 100  # a commanded power plant is refused while the margin is this big
 # Concentration of force ("many beat few"): fight only where we outnumber.
 SUPERIOR = 1.5              # attack at any size when this much stronger than their known army
@@ -1436,7 +1445,10 @@ class RedAlertBot:
                 self._main_state = f"emergency retreat: crushed ({ours_s:.0f} vs {theirs_s:.0f})"
                 self.log(f"[bot] {self._main_state}")
                 return micro + orders + self._move_home([u["id"] for u in force], staging, max_units)
-            if target and force and not self._recent("attack", 2.0):
+            fight = self._doctrine(raw, force, enemies, staging, ours_s, theirs_s, notes)
+            if fight is not None:
+                orders += fight
+            elif target and force and not self._recent("attack", 2.0):
                 # Reached the target and (almost) nothing is there: an attack
                 # that has cleared its point carries on to the nearest known
                 # enemy building, and keeps doing so until the commander gives
@@ -1504,6 +1516,65 @@ class RedAlertBot:
                 order = {**order, "units": ids}
             kept.append(order)
         return kept + micro
+
+    def _doctrine(self, raw: dict, force: list[dict], enemies: list[dict], staging, ours_s: float,
+                  theirs_s: float, notes: list[str]) -> list[dict] | None:
+        """Many vs few: surround and annihilate. Few vs many: hit and run.
+        None when the army is not in a fight (or evenly matched): the
+        commander's movement orders apply."""
+        foes = [e for e in enemies if _xy(e) and self._is_combat(e)]
+        body = [u for u in force if _xy(u)]
+        if not foes or not body or theirs_s < DOCTRINE_MIN:
+            self._fight_mode = None
+            return None
+        centre = self._centroid([_xy(u) for u in body])
+        near = [e for e in foes if _dist(_xy(e), centre) <= CONTACT_RANGE + 4]
+        if not near:
+            self._fight_mode = None
+            return None
+        ratio = ours_s / theirs_s
+        ec = self._centroid([_xy(e) for e in near])
+        if ratio >= SURROUND_RATIO:
+            if self._recent("doctrine", 1.5):
+                return []
+            self._mark("doctrine")
+            # Encircle: each unit closes on its own slot of a ring round their
+            # group, keeping its side, so they are hit from every direction.
+            orders: list[dict] = []
+            slots: dict[tuple[int, int], list[int]] = {}
+            for u in body:
+                ux, uy = _xy(u)
+                ang = math.atan2(uy - ec[1], ux - ec[0])
+                ang = round(ang / (math.pi / 4)) * (math.pi / 4)  # 8 sides
+                slot = self._clamp((int(round(ec[0] + math.cos(ang) * SURROUND_RADIUS)),
+                                    int(round(ec[1] + math.sin(ang) * SURROUND_RADIUS))), raw)
+                slots.setdefault(slot, []).append(u["id"])
+            for slot, ids in slots.items():
+                orders.append({"cmd": "attack_move", "units": ids[:50], "to": list(slot)})
+            mode = f"many vs few ({ratio:.1f}x): surrounding {len(near)} of theirs at {list(ec)} from {len(slots)} sides"
+        elif ratio < HARASS_RATIO:
+            if self._recent("doctrine", 1.0):
+                return []
+            self._mark("doctrine")
+            coming = [e for e in near if self._approaching(e, centre)]
+            ids = [u["id"] for u in body]
+            if coming:
+                dest = self._flee_cell(centre, [_xy(e) for e in coming], staging or getattr(self, "_base_cell", None),
+                                       raw, HARASS_STEP)
+                orders = [{"cmd": "move", "units": chunk, "to": list(dest)} for chunk in _chunks(ids, 50)]
+                mode = f"few vs many ({ratio:.1f}x): backing off while they come on"
+            else:
+                orders = [{"cmd": "attack_move", "units": chunk, "to": list(ec)} for chunk in _chunks(ids, 50)]
+                mode = f"few vs many ({ratio:.1f}x): they stopped, hitting back"
+        else:
+            self._fight_mode = None
+            return None
+        if mode.split(":")[0] != (getattr(self, "_fight_mode", None) or "").split(":")[0]:
+            self.log(f"[bot] {mode}")
+        self._fight_mode = mode
+        self._main_state = mode
+        notes.append(mode)
+        return orders
 
     def _pincer_step(self, raw: dict, force: list[dict], enemies: list[dict], target, staging,
                      notes: list[str]) -> list[dict]:
@@ -1781,7 +1852,10 @@ class RedAlertBot:
                 phase = "withdraw"  # intercepted on the way in
         if phase == "strike":
             hurt = self._raid_hp_start > 0 and hp < self._raid_hp_start * (1 - RAID_HURT_SHARE)
-            if threatened or hurt or now >= self._raid_strike_until:
+            # Many vs few: nobody defending and prey in reach -> finish it off.
+            prey = any(_xy(e) and _dist(_xy(e), centre) <= 10 and not self._is_combat(e) for e in enemies)
+            unopposed = responders == 0 and prey and now < self._raid_strike_until - RAID_STRIKE_S + RAID_STRIKE_MAX_S
+            if threatened or hurt or (now >= self._raid_strike_until and not unopposed):
                 phase = "withdraw"
         if phase == "withdraw":
             # Run for at least RAID_NOT_CHASED_S, then stop once nobody chases.

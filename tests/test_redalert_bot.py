@@ -889,3 +889,49 @@ def test_pincer_window_is_flagged():
     b = bot()
     b._raid_info = {"size": 3, "phase": "withdraw", "at": [40, 40], "responders": 1800, "responders_from_their_base": 26}
     assert "PINCER WINDOW" in b._situation()
+
+
+def test_many_vs_few_surrounds_from_several_sides():
+    army = [{"id": 100 + i, "type": "3tnk", "x": 50 + (i % 3) * 2 - 2, "y": 50 + (i // 3) * 2 - 2, "idle": False, "hp": 100}
+            for i in range(9)]
+    foes = [{"id": 900 + i, "type": "2tnk", "x": 58, "y": 50 + i, "hp": 100} for i in range(2)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 50}))
+    b.rules = {"3tnk": {"cost": 1150, "speed": 1.56}, "2tnk": {"cost": 850, "speed": 1.76}}
+    orders = _orders(b.choose_action(_state(_base_obs(units=army, visible_enemies=foes)), CTX))
+    assert "surround" in b.status()["main_state"]
+    rings = {tuple(o["to"]) for o in orders if o["cmd"] == "attack_move" and set(o["units"]) & set(range(100, 109))}
+    focus = [o for o in orders if o["cmd"] == "attack"]
+    assert focus or len(rings) >= 2  # units in range focus fire; the rest close in from more than one side
+
+
+def test_few_vs_many_backs_off_then_hits_back():
+    import time as _t
+    army = [{"id": 100 + i, "type": "2tnk", "x": 50, "y": 50, "idle": False, "hp": 100} for i in range(3)]
+    foes = [{"id": 900 + i, "type": "3tnk", "x": 57, "y": 50, "hp": 100} for i in range(5)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 50}))
+    b.rules = {"3tnk": {"cost": 1150, "speed": 1.56}, "2tnk": {"cost": 850, "speed": 1.76}}
+    # They come on (seen closer than a moment ago): back off, away from them.
+    b._enemy_hist = {900 + i: __import__("collections").deque([(_t.monotonic(), (60, 50))], maxlen=10) for i in range(5)}
+    orders = _orders(b.choose_action(_state(_base_obs(units=army, visible_enemies=foes)), CTX))
+    assert "backing off" in b.status()["main_state"]
+    assert any(o["cmd"] == "move" and o["to"][0] < 50 for o in orders)
+    # They stop: turn and hit.
+    b._enemy_hist = {}
+    b._sent.clear()
+    orders = _orders(b.choose_action(_state(_base_obs(units=army, visible_enemies=foes)), CTX))
+    assert "hitting back" in b.status()["main_state"]
+
+
+def test_unopposed_raid_finishes_the_harvester():
+    import time as _t
+    from agent import redalert_bot as rb
+    squad = [{"id": 100 + i, "type": "jeep", "x": 72, "y": 72, "idle": True, "hp": 100} for i in range(3)]
+    harv = [{"id": 800, "type": "harv", "x": 74, "y": 73, "hp": 40}]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 3, "raid_x": 74, "raid_y": 73}))
+    b.rules = {"jeep": {"cost": 500, "speed": 4.0}, "harv": {"cost": 1100}}
+    b.choose_action(_state(_base_obs(units=squad, visible_enemies=harv)), CTX)
+    assert b._raid_phase == "strike"
+    b._raid_strike_until -= rb.RAID_STRIKE_S + 1  # the usual strike time is over...
+    b._sent.clear()
+    b.choose_action(_state(_base_obs(units=squad, visible_enemies=harv)), CTX)
+    assert b._raid_phase == "strike"  # ...but nobody defends it: keep hitting until it dies
