@@ -751,8 +751,9 @@ def test_raid_hit_and_run_cycle():
     assert b._raid_phase == "withdraw"
     run = [o for o in orders if o["cmd"] == "move" and set(o["units"]) == {100, 101, 102}]
     assert run and run[0]["to"][0] < 72
-    # Clear of them: reset, then after the pause approach again on the other flank.
+    # Clear of them (after running a moment): reset, then approach again on the other flank.
     side = b._raid_side
+    b._raid_phase_since -= 3
     b._sent.clear()
     b.choose_action(_state(_base_obs(units=squad)), CTX)
     assert b._raid_phase == "reset"
@@ -773,3 +774,38 @@ def test_raiders_shoot_harvesters_not_tanks():
     orders = _orders(b.choose_action(_state(_base_obs(units=squad, visible_enemies=foes)), CTX))
     shots = [o for o in orders if o["cmd"] == "attack" and set(o["units"]) & {100, 101, 102}]
     assert shots and all(o["target"] == 800 for o in shots)
+
+
+def test_raid_runs_when_hurt_and_goes_back_once_they_stop_chasing():
+    import time as _t
+    squad = [{"id": 100 + i, "type": "jeep", "x": 72, "y": 72, "idle": True, "hp": 100} for i in range(3)]
+    harv = [{"id": 800, "type": "harv", "x": 74, "y": 73, "hp": 100}]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 3, "raid_x": 74, "raid_y": 73}))
+    b.rules = {"jeep": {"cost": 500, "speed": 4.0}, "harv": {"cost": 1100}, "e1": {"cost": 100, "speed": 1.32}}
+    b.choose_action(_state(_base_obs(units=squad, visible_enemies=harv)), CTX)
+    assert b._raid_phase == "strike"
+    # Took a few hits (no responder seen yet): run anyway.
+    hurt = [{**u, "hp": 80} for u in squad]
+    b._sent.clear()
+    b.choose_action(_state(_base_obs(units=hurt, visible_enemies=harv)), CTX)
+    assert b._raid_phase == "withdraw"
+    # Nobody is coming after it: after a moment it resets, then goes straight back in.
+    b._raid_last_chased = _t.monotonic() - 5
+    b._raid_phase_since -= 3  # ran for 3 s
+    b._sent.clear()
+    b.choose_action(_state(_base_obs(units=[{**u, "x": 60} for u in hurt])), CTX)
+    assert b._raid_phase == "reset"
+    b._raid_phase_since -= 4
+    b._sent.clear()
+    b.choose_action(_state(_base_obs(units=[{**u, "x": 60} for u in hurt])), CTX)
+    assert b._raid_phase == "approach"
+
+
+def test_infantry_is_not_used_for_a_raid_when_fast_units_exist():
+    units = [{"id": 100 + i, "type": "e1", "x": 26, "y": 26, "idle": True, "hp": 100} for i in range(5)]
+    units += [{"id": 200 + i, "type": "jeep", "x": 27, "y": 26, "idle": True, "hp": 100} for i in range(3)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 3, "raid_unit": "e1"}))
+    b.rules = {"jeep": {"cost": 500, "speed": 4.0}, "e1": {"cost": 100, "speed": 1.32}}
+    b.choose_action(_state(_base_obs(units=units)), CTX)
+    assert b._raiders == {200, 201, 202}
+    assert any("too slow" in p for p in b.status()["problems"])

@@ -94,12 +94,16 @@ RAID_PULLBACK_COOLDOWN_S = 20.0  # no new raid squad this long after one ran hom
 RAID_DETOUR = 16            # a raid flanks this many cells to the quieter side of the direct line
 # Hit and run: approach -> strike (briefly, harvesters first) -> withdraw the
 # moment responders arrive -> reset on the other flank -> approach again.
-RAID_STRIKE_S = 10.0        # longest strike before withdrawing anyway
+RAID_STRIKE_S = 6.0         # hit for a few seconds, then go, whatever happens
 RAID_RESPONSE_RANGE = 9     # enemy combat units this close to the squad count as responders
-RAID_WITHDRAW_RATIO = 0.6   # withdraw when responders reach this share of the squad's strength
-RAID_SAFE_RANGE = 14        # withdrawn once every enemy combat unit is this far away
+RAID_ALERT_RANGE = 13       # ... and these, if they are coming at us
+RAID_WITHDRAW_RATIO = 0.35  # withdraw when responders reach this share of the squad's strength
+RAID_HURT_SHARE = 0.12      # ... or when the squad has lost this share of its hp since the strike began
+RAID_SAFE_RANGE = 14        # withdrawn once every enemy combat unit is this far away ...
+RAID_NOT_CHASED_S = 2.0     # ... or none has come closer for this long (they stopped chasing)
 RAID_WITHDRAW_MAX_S = 12.0  # or after this long
-RAID_RESET_S = 10.0         # pause (and top up) before the next approach, on the other flank
+RAID_RESET_S = 3.0          # a short breath (and top-up), then straight back in
+RAID_FAST = 2.0             # raid squads are units at least this fast (cells/s); infantry is 1.3
 RAID_WITHDRAW_STEP = 16     # cells per withdraw order
 RAID_TARGET_VALUE = {"harv": 10.0, "mcv": 8.0, "arty": 6.0, "v2rl": 6.0, "e1": 1.5, "e3": 1.2, "e6": 2.0,
                      "medi": 2.0, "jeep": 1.0, "ftrk": 0.8, "apc": 0.6}
@@ -230,6 +234,8 @@ class RedAlertBot:
         self._raid_phase_since = 0.0
         self._raid_strike_until = 0.0
         self._raid_info: dict = {}               # what the squad is doing, for the commander
+        self._raid_hp_start = 0.0                # squad hp when the strike began
+        self._raid_last_chased = 0.0             # when an enemy last came closer to the squad
         self._no_queued = False                  # the server refused queued orders
         self._enemy_ore: tuple[int, int] | None = None
         self._enemy_harv_seen: dict[int, tuple[tuple[int, int], float]] = {}
@@ -1313,6 +1319,10 @@ class RedAlertBot:
                 self._raid_phase, self._raid_phase_since = "approach", time.monotonic()
             spare = [u for i, u in alive.items() if i not in self._raiders and u.get("idle")]
             want = str(d.get("raid_unit") or "").lower()
+            if want and size >= 2 and DEFAULT_SPEED.get(want, 2.0) < RAID_FAST \
+                    and any(self._speed(u) >= RAID_FAST for u in spare):
+                self._problem(f"raid_unit {want} is too slow to hit and run; using fast units instead")
+                want = ""
             if want:
                 typed = [u for u in spare if str(u.get("type", "")).lower() == want]
                 if not typed and spare:
@@ -1609,35 +1619,50 @@ class RedAlertBot:
             return None
         centre = self._centroid([_xy(u) for u in squad])
         combat_foes = [e for e in enemies if _xy(e) and self._is_combat(e)]
-        near_foes = [e for e in combat_foes if _dist(_xy(e), centre) <= RAID_RESPONSE_RANGE]
+        # Responders: combat units on top of us, or coming at us from a bit further.
+        near_foes = [e for e in combat_foes if _dist(_xy(e), centre) <= RAID_RESPONSE_RANGE
+                     or (_dist(_xy(e), centre) <= RAID_ALERT_RANGE and self._approaching(e, centre))]
         responders = sum(self._strength(e) for e in near_foes)
         squad_s = sum(self._strength(u) for u in squad) or 1.0
         return squad, centre, combat_foes, near_foes, responders, squad_s
 
     def _raid_phase_update(self, target, alive: dict[int, dict], enemies: list[dict]) -> None:
-        """Hit and run. The squad approaches along a flank, strikes briefly
-        (harvesters first), withdraws the moment responders arrive, resets on
-        the other flank and goes again. It never fights to the end."""
+        """Hit and run, to annoy. The squad approaches along a flank, hits
+        (harvesters first) for a few seconds, and runs the moment anything
+        comes at it or it gets hurt. Once they stop chasing it goes straight
+        back in, on the other flank. It never fights to the end."""
         view = self._raid_view(alive, enemies)
         if view is None or not target:
             return
         squad, centre, combat_foes, near_foes, responders, squad_s = view
         now = time.monotonic()
+        hp = sum(float(u.get("hp", 100) or 0) for u in squad)
+        if any(self._approaching(e, centre) and _dist(_xy(e), centre) <= RAID_SAFE_RANGE for e in combat_foes):
+            self._raid_last_chased = now
         phase = self._raid_phase
+        threatened = responders >= RAID_WITHDRAW_RATIO * squad_s
         if phase == "approach":
             if _dist(centre, target) <= 8:
-                phase, self._raid_strike_until = "strike", now + RAID_STRIKE_S
-            elif responders >= RAID_WITHDRAW_RATIO * squad_s:
+                phase, self._raid_strike_until, self._raid_hp_start = "strike", now + RAID_STRIKE_S, hp
+            elif threatened:
                 phase = "withdraw"  # intercepted on the way in
-        if phase == "strike" and (responders >= RAID_WITHDRAW_RATIO * squad_s or now >= self._raid_strike_until):
-            phase = "withdraw"
+        if phase == "strike":
+            hurt = self._raid_hp_start > 0 and hp < self._raid_hp_start * (1 - RAID_HURT_SHARE)
+            if threatened or hurt or now >= self._raid_strike_until:
+                phase = "withdraw"
         if phase == "withdraw":
+            # Run for at least RAID_NOT_CHASED_S, then stop once nobody chases.
+            started = self._raid_phase_since if self._raid_phase == "withdraw" else now
+            calm_since = max(self._raid_last_chased, started)
             clear = all(_dist(_xy(e), centre) > RAID_SAFE_RANGE for e in combat_foes)
-            if clear or now - self._raid_phase_since > RAID_WITHDRAW_MAX_S:
+            not_chased = now - calm_since >= RAID_NOT_CHASED_S and not threatened
+            if (clear and now - started >= RAID_NOT_CHASED_S) or not_chased or now - started > RAID_WITHDRAW_MAX_S:
                 phase = "reset"
-        if phase == "reset" and now - self._raid_phase_since >= RAID_RESET_S:
+        reset_since = self._raid_phase_since if self._raid_phase == "reset" else now
+        if phase == "reset" and now - reset_since >= RAID_RESET_S and not threatened:
+            # They stopped chasing: back in at once, from the other flank.
             phase = "approach"
-            self._raid_side = -(self._raid_side or 1)  # the other flank this time
+            self._raid_side = -(self._raid_side or 1)
         if phase != self._raid_phase:
             self._raid_phase, self._raid_phase_since = phase, now
             self.log(f"[bot] raid: {phase} ({len(squad)} units at {list(centre)}, responders {responders:.0f} vs {squad_s:.0f})")
@@ -1646,6 +1671,7 @@ class RedAlertBot:
             "size": len(squad), "phase": phase, "at": list(centre), "target": list(target),
             "responders": round(responders),
             "responders_from_their_base": round(min(_dist(_xy(e), eb) for e in near_foes)) if near_foes and eb else None,
+            "slow_units": sum(1 for u in squad if self._speed(u) < RAID_FAST),
         }
 
     def _run_raid(self, target, alive: dict[int, dict], enemies: list[dict], enemy_base, staging, raw: dict,
