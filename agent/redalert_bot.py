@@ -1352,6 +1352,10 @@ class RedAlertBot:
 
         # Raid squad: the size the commander chose, at least the general's
         # standing raid (unless enemies are at our base and everyone is needed).
+        if not self._raiders and self._raid_phase != "approach":
+            # The last squad is gone (killed or recalled): the next one starts fresh.
+            self._raid_phase, self._raid_phase_since = "approach", time.monotonic()
+            self._raid_info = {}
         before = set(self._raiders)
         size = d["raid_size"]
         if size >= 2:

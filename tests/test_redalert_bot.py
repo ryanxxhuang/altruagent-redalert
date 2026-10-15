@@ -935,3 +935,13 @@ def test_unopposed_raid_finishes_the_harvester():
     b._sent.clear()
     b.choose_action(_state(_base_obs(units=squad, visible_enemies=harv)), CTX)
     assert b._raid_phase == "strike"  # ...but nobody defends it: keep hitting until it dies
+
+
+def test_a_new_raid_squad_forms_after_the_last_one_died_mid_withdraw():
+    units = [{"id": 200 + i, "type": "ftrk", "x": 30, "y": 30, "idle": True, "hp": 100} for i in range(3)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 3, "raid_unit": "ftrk"}))
+    b.rules = {"ftrk": {"cost": 600, "speed": 2.76}}
+    b._raid_phase = "withdraw"  # the old scout died while running
+    b._raiders = set()
+    b.choose_action(_state(_base_obs(units=units)), CTX)
+    assert b._raiders == {200, 201, 202}
