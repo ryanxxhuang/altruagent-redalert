@@ -809,3 +809,12 @@ def test_infantry_is_not_used_for_a_raid_when_fast_units_exist():
     b.choose_action(_state(_base_obs(units=units)), CTX)
     assert b._raiders == {200, 201, 202}
     assert any("too slow" in p for p in b.status()["problems"])
+
+
+def test_raid_squad_takes_moving_units_not_only_idle_ones():
+    units = [{"id": 100 + i, "type": "e3", "x": 40, "y": 40, "idle": False, "hp": 100} for i in range(6)]
+    units.append({"id": 200, "type": "jeep", "x": 30, "y": 30, "idle": False, "hp": 100})  # on its way to the front
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "raid_size": 2, "raid_unit": "jeep"}))
+    b.rules = {"jeep": {"cost": 500, "speed": 4.0}, "e3": {"cost": 300, "speed": 1.32}}
+    b.choose_action(_state(_base_obs(units=units)), CTX)
+    assert 200 in b._raiders

@@ -1317,7 +1317,11 @@ class RedAlertBot:
                 and not self._recent("raid_pullback", RAID_PULLBACK_COOLDOWN_S):
             if not self._raiders:
                 self._raid_phase, self._raid_phase_since = "approach", time.monotonic()
-            spare = [u for i, u in alive.items() if i not in self._raiders and u.get("idle")]
+            # Any unit not in a fight can be pulled into the squad: new units
+            # walk to the front at once and are never "idle".
+            def free(u: dict) -> bool:
+                return not any(_xy(e) and _dist(_xy(e), _xy(u)) <= 10 for e in enemies if self._is_combat(e))
+            spare = [u for i, u in alive.items() if i not in self._raiders and free(u)]
             want = str(d.get("raid_unit") or "").lower()
             if want and size >= 2 and DEFAULT_SPEED.get(want, 2.0) < RAID_FAST \
                     and any(self._speed(u) >= RAID_FAST for u in spare):
