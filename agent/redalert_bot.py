@@ -105,6 +105,16 @@ RAID_WITHDRAW_MAX_S = 12.0  # or after this long
 RAID_RESET_S = 3.0          # a short breath (and top-up), then straight back in
 RAID_FAST = 2.0             # raid squads are units at least this fast (cells/s); infantry is 1.3
 RAID_VEHICLES = ("jeep", "ftrk", "1tnk", "apc")  # what the bot builds to fill a raid squad
+# Ground range of enemy defenses (cells); anti-air defenses don't shoot ground units.
+DEFENSE_RANGE = {"pbox": 5.0, "hbox": 5.0, "gun": 6.5, "ftur": 5.0, "tsla": 7.0, "agun": 0.0, "sam": 0.0, "gap": 0.0}
+DEFENSE_MARGIN = 3.0        # raids stay this far outside a defense's reach
+SIEGE_RANGE = 9.0           # units with at least this range (v2rl, arty) shell defenses from outside their reach
+# APC raid (Soviets): one APC carries infantry to their ore field, drops them, picks them up, leaves.
+APC_CAPACITY = 5
+APC_LOAD_S = 12.0           # longest wait for riders to board
+APC_DROP_RANGE = 7          # unload this close to the target
+APC_FIGHT_S = 15.0          # longest fight before picking up
+APC_PICKUP_S = 6.0          # longest wait for riders to re-board before the APC leaves
 PINCER_FLANK_SHARE = 0.4    # the fastest units, up to this share of the strength, go round the back
 PINCER_HOLD = 12            # the front waits this far from the target until the flank is in place
 PINCER_BEHIND = 8           # the flank's attack position: this far past the target, seen from the front
@@ -281,6 +291,7 @@ class RedAlertBot:
         self._onward: tuple[int, int] | None = None  # where an attack carries on after clearing its target
         self._onward_for: tuple | None = None        # the commander's target that onward belongs to
         self._pincer: dict | None = None             # the current pincer: target, flank ids, phase
+        self._apc: dict | None = None                # the APC raid: apc id, rider ids, phase
         self._retreat_issued = False
         self._wave_peak = 0
         self._last_status = 0.0
@@ -371,6 +382,7 @@ class RedAlertBot:
             "enemy_ore_field": list(self._enemy_ore) if self._enemy_ore else None,
             "raid_squad": len(self._raiders),
             "raid": self._raid_info,
+            "apc_raid": getattr(self, "_apc_info", None) if self._apc else None,
             "main_idle_seconds": round(self._game_s - self._holding_since) if self._holding_since is not None else 0,
             "idle_combat_units": getattr(self, "_idle_combat", 0),
             "strength_ahead": round(getattr(self, "_ahead", 0)),
@@ -491,6 +503,8 @@ class RedAlertBot:
 
     def _range(self, actor: dict) -> float:
         t = str(actor.get("type", "")).lower()
+        if t in DEFENSE_RANGE:
+            return DEFENSE_RANGE[t]
         if t not in self._range_cache:
             r = _weapon_range(self.rules.get(t))
             self._range_cache[t] = r if r is not None else DEFAULT_RANGE.get(t, 4.0)
@@ -798,10 +812,14 @@ class RedAlertBot:
         orders: list[dict] = []
         handled: set[str] = set()
         # The commander's raid squad needs fast vehicles: build them first.
-        if d and d.get("raid_size", 0) >= 2 and "Vehicle" not in busy and not self._recent("vehicle", 0.8):
-            fast_owned = sum(1 for u in army if self._speed(u) >= RAID_FAST) + sum(
-                queued[v] for v in RAID_VEHICLES)
-            if fast_owned < d["raid_size"]:
+        apc_mode = bool(d) and str(d.get("raid_unit") or "").lower() == "apc"
+        if d and d.get("raid_size", 0) >= (1 if apc_mode else 2) and "Vehicle" not in busy and not self._recent("vehicle", 0.8):
+            if apc_mode:
+                fast_owned = sum(1 for u in army if str(u.get("type", "")).lower() == "apc") + queued["apc"]
+            else:
+                fast_owned = sum(1 for u in army if self._speed(u) >= RAID_FAST) + sum(
+                    queued[v] for v in RAID_VEHICLES)
+            if fast_owned < (1 if apc_mode else d["raid_size"]):
                 want = str(d.get("raid_unit") or "").lower()
                 options = ([want] if want in RAID_VEHICLES else []) + list(RAID_VEHICLES)
                 item = next((v for v in options if v in available and not self._blocked_now(v)), None)
@@ -961,6 +979,7 @@ class RedAlertBot:
             return orders, pulled  # retreating: nobody turns back to fight
         # A raid squad on its way out is running already: micro leaves it alone.
         raid_away = set(self._raiders) if self._raid_phase in ("withdraw", "reset") else set()
+        raid_away |= self._apc_ids()
         kite_orders, kiting = self._kite(raw, ours, enemies, pulled | raid_away, base)
         if kite_orders:
             orders += kite_orders
@@ -1017,7 +1036,8 @@ class RedAlertBot:
 
     def _can_kite(self, unit: dict, enemy: dict) -> bool:
         ru, re_ = self._range(unit), self._range(enemy)
-        su, se = self._speed(unit), self._speed(enemy)
+        su = self._speed(unit)
+        se = 0.0 if str(enemy.get("type", "")).lower() in DEFENSE_RANGE else self._speed(enemy)
         if ru <= 0 or re_ <= 0 or su <= 0:
             return False
         return ru >= re_ + 1.0 or (su >= se * 1.3 and ru >= re_ - 0.75)
@@ -1026,17 +1046,26 @@ class RedAlertBot:
               base) -> tuple[list[dict], set[int]]:
         now = time.monotonic()
         threats = [e for e in enemies if _xy(e) and isinstance(e.get("id"), int) and self._range(e) > 0]
-        if not threats:
+        has_defenses = any(str(b.get("type", "")).lower() in DEFENSE_RANGE
+                           for b in getattr(self, "_visible_enemy_buildings", []))
+        if not threats and not has_defenses:
             self._kite_state.clear()
             return [], set()
         flee: dict[tuple[int, int], list[int]] = {}
         fight: dict[int, list[int]] = {}
         controlled: set[int] = set()
+        # Siege units (V2, artillery) treat defenses as threats to stay out of
+        # and as targets to shell from beyond their reach.
+        defenses = [b for b in getattr(self, "_visible_enemy_buildings", [])
+                    if _xy(b) and isinstance(b.get("id"), int) and self._range(b) > 0
+                    and str(b.get("type", "")).lower() in DEFENSE_RANGE]
         for uid, u in ours.items():
             if uid in exclude:
                 continue
             uc = _xy(u)
-            near = [(e, _dist(_xy(e), uc)) for e in threats if _dist(_xy(e), uc) <= self._range(e) + KITE_WATCH]
+            siege = self._range(u) >= SIEGE_RANGE
+            pool = threats + defenses if siege else threats
+            near = [(e, _dist(_xy(e), uc)) for e in pool if _dist(_xy(e), uc) <= self._range(e) + KITE_WATCH]
             if not near:
                 self._kite_state.pop(uid, None)
                 continue
@@ -1058,9 +1087,14 @@ class RedAlertBot:
             else:
                 # It stopped or turned back: turn and shoot (best target in range, else it).
                 ru = self._range(u)
-                in_range = [x for x in enemies if _xy(x) and isinstance(x.get("id"), int) and _dist(_xy(x), uc) <= ru + 0.5]
+                shootable = enemies + (defenses if siege else [])
+                in_range = [x for x in shootable if _xy(x) and isinstance(x.get("id"), int) and _dist(_xy(x), uc) <= ru + 0.5]
                 score = self._raid_target_score if uid in self._raiders else self._target_score
-                key = (max(in_range, key=score) if in_range else e)["id"]
+                if siege:
+                    # Defenses first: that is what siege is for.
+                    key = (max(in_range, key=lambda x: (x in defenses, score(x))) if in_range else e)["id"]
+                else:
+                    key = (max(in_range, key=score) if in_range else e)["id"]
                 mode = "fight"
             prev = self._kite_state.get(uid)
             wait = KITE_REISSUE_FLEE if mode == "flee" else KITE_REISSUE_FIGHT
@@ -1126,6 +1160,17 @@ class RedAlertBot:
             if strength > best:
                 best, cell, age = strength, (e["x"], e["y"]), now - max(f["t"] for f in group)
         return best, cell, age
+
+    def _defense_reach(self, b: dict) -> float:
+        return DEFENSE_RANGE.get(str(b.get("type", "")).lower(), 5.0)
+
+    def _covered_by_defense(self, cell, margin: float = DEFENSE_MARGIN) -> dict | None:
+        """The enemy defense whose reach (plus margin) covers ``cell``, if any."""
+        for b in self.enemy_defenses():
+            reach = self._defense_reach(b)
+            if reach > 0 and _dist(_xy(b), cell) <= reach + margin:
+                return b
+        return None
 
     def enemy_defenses(self) -> list[dict]:
         """Enemy defenses we have seen (pillboxes, turrets, tesla coils...)."""
@@ -1335,7 +1380,13 @@ class RedAlertBot:
 
         # The raid squad's phase comes first: micro leaves a withdrawing squad alone.
         self._raiders &= set(alive)
-        rtarget = cell(d["raid_x"], d["raid_y"], None) or self._raid_cell(enemy_base) or enemy_base
+        rtarget = cell(d["raid_x"], d["raid_y"], None)
+        if rtarget and self._covered_by_defense(rtarget):
+            b = self._covered_by_defense(rtarget)
+            self._problem(f"raid target {list(rtarget)} is inside the reach of their {b.get('type')} at "
+                          f"{list(_xy(b))}; raiding the uncovered ore instead")
+            rtarget = None
+        rtarget = rtarget or self._raid_cell(enemy_base)
         if self._raiders:
             self._raid_phase_update(rtarget, alive, enemies)
         micro, controlled = self._micro(raw, army, enemies, staging, base, notes)
@@ -1357,7 +1408,8 @@ class RedAlertBot:
             self._raid_phase, self._raid_phase_since = "approach", time.monotonic()
             self._raid_info = {}
         before = set(self._raiders)
-        size = d["raid_size"]
+        apc_mode = str(d.get("raid_unit") or "").lower() == "apc"
+        size = 0 if apc_mode else d["raid_size"]
         if size >= 2:
             self._raiders = {i for i in self._raiders if self._speed(alive[i]) >= RAID_FAST}
         standing = int(self.knobs.get("standing_raid", 0) or 0)
@@ -1400,15 +1452,19 @@ class RedAlertBot:
                 spare.sort(key=lambda u: self._cost(str(u.get("type", "")).lower()))
             else:
                 spare.sort(key=self._speed, reverse=True)
-            self._raiders |= {u["id"] for u in spare[: size - len(self._raiders)]}
+            added = spare[: size - len(self._raiders)]
+            self._raiders |= {u["id"] for u in added}
+            if added:
+                self.log(f"[bot] raid squad: {sorted(str(u.get('type')) for u in added)} joined ({len(self._raiders)} total)")
         if self._raiders:
             if self._raiders != before:
                 self._raid_phase_update(rtarget, alive, enemies)  # a new or changed squad: its phase now
             orders += self._run_raid(rtarget, alive, enemies, enemy_base, staging, raw, controlled)
         else:
             self._raid_info = {}
+        orders += self._apc_raid(d, alive, enemies, rtarget, staging, raw)
 
-        main = [u for i, u in alive.items() if i not in self._raiders]
+        main = [u for i, u in alive.items() if i not in self._raiders and i not in self._apc_ids()]
         self._idle_combat = sum(1 for u in main if u.get("idle"))
         self._main_centre = self._centroid([_xy(u) for u in main]) if main else None
         # Reflex: enemies at our base are fought by whoever is home.
@@ -1830,6 +1886,9 @@ class RedAlertBot:
         # Responders: combat units on top of us, or coming at us from a bit further.
         near_foes = [e for e in combat_foes if _dist(_xy(e), centre) <= RAID_RESPONSE_RANGE
                      or (_dist(_xy(e), centre) <= RAID_ALERT_RANGE and self._approaching(e, centre))]
+        # A defense that has us in reach is a responder too (it shoots, it doesn't chase).
+        near_foes += [b for b in self.enemy_defenses()
+                      if self._defense_reach(b) > 0 and _dist(_xy(b), centre) <= self._defense_reach(b) + 1.5]
         responders = sum(self._strength(e) for e in near_foes)
         squad_s = sum(self._strength(u) for u in squad) or 1.0
         return squad, centre, combat_foes, near_foes, responders, squad_s
@@ -1848,12 +1907,16 @@ class RedAlertBot:
         if any(self._approaching(e, centre) and _dist(_xy(e), centre) <= RAID_SAFE_RANGE for e in combat_foes):
             self._raid_last_chased = now
         phase = self._raid_phase
-        threatened = responders >= RAID_WITHDRAW_RATIO * squad_s
+        under_fire = any(str(e.get("type", "")).lower() in DEFENSE_RANGE for e in near_foes)
+        threatened = responders >= RAID_WITHDRAW_RATIO * squad_s or under_fire
         if phase == "approach":
+            if self._raid_hp_start <= 0 or hp > self._raid_hp_start:
+                self._raid_hp_start = hp
+            hurt_on_way = hp < self._raid_hp_start * (1 - RAID_HURT_SHARE)
             if _dist(centre, target) <= 8:
                 phase, self._raid_strike_until, self._raid_hp_start = "strike", now + RAID_STRIKE_S, hp
-            elif threatened:
-                phase = "withdraw"  # intercepted on the way in
+            elif threatened or hurt_on_way:
+                phase = "withdraw"  # intercepted (or shot at) on the way in
         if phase == "strike":
             hurt = self._raid_hp_start > 0 and hp < self._raid_hp_start * (1 - RAID_HURT_SHARE)
             # Many vs few: nobody defending and prey in reach -> finish it off.
@@ -1874,6 +1937,7 @@ class RedAlertBot:
             # They stopped chasing: back in at once, from the other flank.
             phase = "approach"
             self._raid_side = -(self._raid_side or 1)
+            self._raid_hp_start = hp
         if phase != self._raid_phase:
             self._raid_phase, self._raid_phase_since = phase, now
             self.log(f"[bot] raid: {phase} ({len(squad)} units at {list(centre)}, responders {responders:.0f} vs {squad_s:.0f})")
@@ -1917,6 +1981,110 @@ class RedAlertBot:
                 if dest:
                     orders.append({"cmd": "move", "units": ids, "to": list(dest)})
                     self._mark("raid_withdraw")
+        return orders
+
+    def _apc_ids(self) -> set[int]:
+        """The APC squad's ids, except while its riders are fighting on foot."""
+        a = self._apc
+        if not a or a["phase"] == "fight":
+            return set()
+        return {a["apc"], *a["riders"]}
+
+    def _apc_raid(self, d: dict, alive: dict[int, dict], enemies: list[dict], target, staging, raw: dict) -> list[dict]:
+        """Soviet APC raid: load up to APC_CAPACITY infantry at home, sneak to
+        their ore field, drop them on the harvesters, fight briefly, pick them
+        up and leave the moment anything comes; riders left behind run home."""
+        now = time.monotonic()
+        want = str(d.get("raid_unit") or "").lower() == "apc" and d.get("raid_size", 0) >= 1
+        a = self._apc
+        if a and a["apc"] not in alive:
+            self.log("[bot] apc raid: the APC is gone")
+            self._apc = a = None
+        if a is None:
+            if not want or not target:
+                return []
+            apcs = [u for u in alive.values() if str(u.get("type", "")).lower() == "apc" and u["id"] not in self._raiders]
+            foot = [u for u in alive.values() if str(u.get("type", "")).lower() in ("e3", "e4", "e1", "e2", "shok")
+                    and u["id"] not in self._raiders
+                    and not any(_xy(e) and _dist(_xy(e), _xy(u)) <= 10 for e in enemies if self._is_combat(e))]
+            if not apcs or len(foot) < 2:
+                if not self._recent("apc_note", 20.0):
+                    self._mark("apc_note")
+                    self._problem("APC raid waiting: needs an APC and 2+ infantry at home (e3 best)")
+                return []
+            home = staging or _xy(apcs[0])
+            apc = min(apcs, key=lambda u: _dist(_xy(u), home))
+            pref = {"e3": 0, "e4": 1, "shok": 1, "e2": 2, "e1": 3}
+            riders = sorted(foot, key=lambda u: (pref.get(str(u.get("type", "")).lower(), 4), _dist(_xy(u), _xy(apc))))
+            riders = [u["id"] for u in riders[:APC_CAPACITY]]
+            self._apc = a = {"apc": apc["id"], "riders": riders, "phase": "load", "since": now}
+            self.log(f"[bot] apc raid: loading {len(riders)} into APC {apc['id']}")
+        apc = alive[a["apc"]]
+        ac = _xy(apc)
+        out = [alive[i] for i in a["riders"] if i in alive]      # riders we can see are on foot
+        squad = [apc] + out
+        squad_s = sum(self._strength(u) for u in squad) + 300 * (len(a["riders"]) - len(out))
+        foes = [e for e in enemies if _xy(e) and self._is_combat(e)]
+        responders = sum(self._strength(e) for e in foes if _dist(_xy(e), ac) <= RAID_ALERT_RANGE) + sum(
+            self._strength(b) for b in self.enemy_defenses() if _dist(_xy(b), ac) <= self._defense_reach(b) + 1.5)
+        threatened = responders >= RAID_WITHDRAW_RATIO * squad_s
+        orders: list[dict] = []
+
+        def go(phase: str) -> None:
+            self.log(f"[bot] apc raid: {phase} (riders {len(a['riders'])}, on foot {len(out)}, responders {responders:.0f})")
+            a["phase"], a["since"] = phase, now
+
+        if a["phase"] == "load":
+            if not out or now - a["since"] > APC_LOAD_S:
+                a["riders"] = [i for i in a["riders"] if i not in alive]  # the ones that boarded
+                if not a["riders"]:
+                    self._problem("APC raid: nobody could board the APC; cancelled")
+                    self._apc = None
+                    return []
+                go("go")
+            elif not self._recent("apc_load", 3.0):
+                orders.append({"cmd": "enter_transport", "units": [u["id"] for u in out], "target": a["apc"]})
+                self._mark("apc_load")
+        if a["phase"] == "go" and target:
+            if threatened:
+                go("home")
+            elif _dist(ac, target) <= APC_DROP_RANGE:
+                orders.append({"cmd": "unload", "units": [a["apc"]]})
+                go("fight")
+            elif not self._recent("apc_move", 4.0):
+                orders += self._raid_orders([a["apc"]], [apc], target, raw)
+                self._mark("apc_move")
+        elif a["phase"] == "fight":
+            prey = any(_xy(e) and not self._is_combat(e) and _dist(_xy(e), ac) <= 10 for e in enemies)
+            if threatened or now - a["since"] > APC_FIGHT_S or (not prey and now - a["since"] > 5):
+                go("pickup")
+            elif target and not self._recent("apc_fight", 2.0):
+                ids = [u["id"] for u in squad]
+                orders.append({"cmd": "attack_move", "units": ids, "to": list(target)})
+                self._mark("apc_fight")
+        if a["phase"] == "pickup":
+            if not out or now - a["since"] > APC_PICKUP_S:
+                left = [u["id"] for u in out]
+                if left and staging:
+                    orders.append({"cmd": "move", "units": left, "to": list(staging)})  # run home on foot
+                a["riders"] = [i for i in a["riders"] if i not in alive]
+                go("home")
+            elif not self._recent("apc_load", 2.0):
+                orders.append({"cmd": "enter_transport", "units": [u["id"] for u in out], "target": a["apc"]})
+                orders.append({"cmd": "stop", "units": [a["apc"]]})
+                self._mark("apc_load")
+        if a["phase"] == "home":
+            if staging and _dist(ac, staging) <= 6:
+                if a["riders"]:
+                    orders.append({"cmd": "unload", "units": [a["apc"]]})
+                self.log("[bot] apc raid: home")
+                self._apc = None
+            elif staging and not self._recent("apc_move", 3.0):
+                threats = [_xy(e) for e in foes if _dist(_xy(e), ac) <= RAID_SAFE_RANGE]
+                dest = self._flee_cell(ac, threats, staging, raw, RAID_WITHDRAW_STEP) if threats else staging
+                orders.append({"cmd": "move", "units": [a["apc"]], "to": list(dest)})
+                self._mark("apc_move")
+        self._apc_info = {"phase": a["phase"] if self._apc else "done", "riders": len(a["riders"]), "on_foot": len(out)}
         return orders
 
     def _raid_route(self, start, target, raw: dict) -> list[tuple[int, int]]:
@@ -1966,16 +2134,27 @@ class RedAlertBot:
         return orders
 
     def _raid_cell(self, enemy_base) -> tuple[int, int] | None:
-        """Where enemy harvesters are: one seen recently, else the ore field by their base."""
+        """Where enemy harvesters are, outside the reach of their defenses: one
+        seen recently, else the part of the ore field by their base that no
+        known defense covers. None when every option is covered."""
         now = time.monotonic()
-        recent = [c for c, t in self._enemy_harv_seen.values() if now - t < 45]
+        recent = [c for c, t in self._enemy_harv_seen.values()
+                  if now - t < 45 and not self._covered_by_defense(c)]
         if recent:
             return recent[-1]
-        if self._raid_target:
+        if self._raid_target and not self._covered_by_defense(self._raid_target):
             return self._raid_target
-        if self._enemy_ore is None and enemy_base:
-            self._enemy_ore = _ore_near(self._config, enemy_base) or enemy_base
-        return self._enemy_ore
+        if not enemy_base:
+            return None
+        cells = _ore_cells_near(self._config, enemy_base) or [enemy_base]
+        safe = [c for c in cells if not self._covered_by_defense(c)]
+        if not safe:
+            if not self._recent("raid_covered_note", 20.0):
+                self._mark("raid_covered_note")
+                self._problem("every ore field near their base is covered by their defenses: raid elsewhere "
+                              "(give raid_x/raid_y) or bring siege units")
+            return None
+        return max(safe, key=lambda c: sum(1 for o in safe if _dist(o, c) <= 4))
 
     def _wave_size(self, raw: dict, army: list[dict] | None = None) -> int:
         n_inf = sum(1 for u in army or [] if str(u.get("type", "")).lower() in ("e1", "e2", "e3", "e4"))
@@ -2176,6 +2355,27 @@ def _opening_for_seat(spec: str, seat: int | None) -> str:
         if key.strip() == f"seat{seat}" and value.strip() in ("rush", "macro"):
             return value.strip()
     return DEFAULT_OPENING
+
+
+def _ore_cells_near(config: dict | None, cell: tuple[int, int], radius: int = 22) -> list[tuple[int, int]]:
+    """Every ore/gem cell within ``radius`` of ``cell`` on the map picture."""
+    try:
+        maps = config["rules"]["maps"]
+    except (TypeError, KeyError):
+        return []
+    for m in maps.values():
+        spawns = [tuple(s) for s in m.get("spawns") or []]
+        if not any(_dist(s, cell) < 3 for s in spawns):
+            continue
+        layout = m.get("layout") or {}
+        ox, oy = layout.get("origin") or (0, 0)
+        return [
+            (ox + j, oy + i)
+            for i, row in enumerate(layout.get("rows") or [])
+            for j, ch in enumerate(row)
+            if ch in "$*" and _dist((ox + j, oy + i), cell) <= radius
+        ]
+    return []
 
 
 def _ore_near(config: dict | None, cell: tuple[int, int], radius: int = 22) -> tuple[int, int] | None:

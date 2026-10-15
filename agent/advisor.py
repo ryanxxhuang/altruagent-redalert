@@ -142,7 +142,9 @@ main_x/main_y: -1 = default (their largest known army group for pincer, else the
 staging point for hold).
 - raid_size: how many units form the raid squad (0 recalls it; the general's standing_raid is the minimum the \
 bot keeps out, general_standing_raid in your input); raid_unit: their type ("" = the fastest \
-available; raids need FAST units, jeep/1tnk/ftrk/apc; "e1" only for a 1-unit scout). A squad of 1 is a scout: use "e1", never a tank (a lone \
+available; raids need FAST units, jeep/1tnk/ftrk; "e1" only for a 1-unit scout; "apc" (Soviets) = an \
+APC RAID: one APC carries up to 5 of our infantry, e3 best, to raid_x/raid_y, drops them on the harvesters, \
+picks them up and leaves; the bot builds the APC if needed, you keep e3 coming). A squad of 1 is a scout: use "e1", never a tank (a lone \
 700-credit tank chased by infantry is a gift to the enemy). raid_x/raid_y: the target (-1,-1 = the enemy ore \
 field, where their harvesters are; bot.enemy_ore_field). A squad that runs home outgunned is not re-formed for \
 20 s (bot.problems says so).

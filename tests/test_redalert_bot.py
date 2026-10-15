@@ -945,3 +945,66 @@ def test_a_new_raid_squad_forms_after_the_last_one_died_mid_withdraw():
     b._raiders = set()
     b.choose_action(_state(_base_obs(units=units)), CTX)
     assert b._raiders == {200, 201, 202}
+
+
+def test_raid_target_avoids_ore_covered_by_a_defense():
+    b = bot()
+    b._config = {"rules": {"maps": {"m": {"spawns": [[80, 80]], "layout": {
+        "origin": [0, 0], "rows": ["." * 100] * 76 + ["." * 76 + "$$$$" + "." * 20] * 4 + ["." * 66 + "$$$" + "." * 31] * 3 + ["." * 100] * 17}}}}}
+    b._enemy_buildings = {950: {"id": 950, "type": "pbox", "x": 77, "y": 77}}
+    cell = b._raid_cell((80, 80))
+    assert cell and cell[0] <= 69  # the uncovered patch, not the one under the pillbox
+    b._enemy_buildings[951] = {"id": 951, "type": "gun", "x": 67, "y": 81}
+    assert b._raid_cell((80, 80)) is None  # every patch covered: no raid there
+
+
+def test_a_defense_shooting_the_raid_makes_it_run():
+    squad = [{"id": 100 + i, "type": "ftrk", "x": 60, "y": 60, "idle": True, "hp": 100} for i in range(3)]
+    pbox = [{"id": 950, "type": "pbox", "x": 63, "y": 60, "hp": 100}]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 3, "raid_unit": "ftrk", "raid_x": 80, "raid_y": 60}))
+    b.rules = {"ftrk": {"cost": 600, "speed": 2.76}, "pbox": {"cost": 600}}
+    b.choose_action(_state(_base_obs(units=squad, visible_enemy_buildings=pbox)), CTX)
+    assert b._raid_phase == "withdraw"
+
+
+def test_siege_units_shell_a_defense_from_outside_its_reach():
+    v2 = [{"id": 100, "type": "v2rl", "x": 50, "y": 50, "idle": True, "hp": 100}]
+    tsla = [{"id": 950, "type": "tsla", "x": 59, "y": 50, "hp": 100}]  # 9 cells: inside V2 range 10, outside tesla 7
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 70, "main_y": 50}))
+    b.rules = {"v2rl": {"cost": 900, "speed": 1.76, "weapon": {"weapon": "SCUD", "range_cells": 10.0}}, "tsla": {"cost": 1200}}
+    orders = _orders(b.choose_action(_state(_base_obs(units=v2, visible_enemy_buildings=tsla)), CTX))
+    assert any(o["cmd"] == "attack" and o["target"] == 950 and 100 in o["units"] for o in orders)
+    # Too close (6 cells): back out of the tesla's reach.
+    b._kite_state.clear()
+    b._sent.clear()
+    close = [{**v2[0], "x": 53}]
+    orders = _orders(b.choose_action(_state(_base_obs(units=close, visible_enemy_buildings=tsla)), CTX))
+    assert any(o["cmd"] == "move" and 100 in o["units"] and o["to"][0] < 53 for o in orders)
+
+
+def test_apc_raid_loads_drops_and_leaves():
+    apc = {"id": 200, "type": "apc", "x": 27, "y": 27, "idle": True, "hp": 100}
+    riders = [{"id": 300 + i, "type": "e3", "x": 26, "y": 27, "idle": True, "hp": 100} for i in range(5)]
+    fake = FakeCommander({"raid_size": 1, "raid_unit": "apc", "raid_x": 70, "raid_y": 70})
+    b = RedAlertBot(log=lambda m: None, advisor=fake)
+    b.rules = {"apc": {"cost": 850, "speed": 3.12}, "e3": {"cost": 300, "speed": 1.32}}
+    orders = _orders(b.choose_action(_state(_base_obs(units=[apc] + riders)), CTX))
+    assert b._apc["phase"] == "load" and len(b._apc["riders"]) == 5
+    assert any(o["cmd"] == "enter_transport" and o["target"] == 200 for o in orders)
+    # They boarded (gone from view): the APC drives off.
+    b._sent.clear()
+    b.choose_action(_state(_base_obs(units=[apc])), CTX)
+    assert b._apc["phase"] == "go"
+    # At the target: unload.
+    b._sent.clear()
+    orders = _orders(b.choose_action(_state(_base_obs(units=[{**apc, "x": 66, "y": 66}])), CTX))
+    assert b._apc["phase"] == "fight" and {"cmd": "unload", "units": [200]} in orders
+    # Their tanks come: pick up, then go home.
+    tanks = [{"id": 900 + i, "type": "3tnk", "x": 72, "y": 66, "hp": 100} for i in range(3)]
+    out = [{**r, "x": 66, "y": 66} for r in riders]
+    b._sent.clear()
+    b.choose_action(_state(_base_obs(units=[{**apc, "x": 66, "y": 66}] + out, visible_enemies=tanks)), CTX)
+    assert b._apc["phase"] == "pickup"
+    b._sent.clear()
+    b.choose_action(_state(_base_obs(units=[{**apc, "x": 66, "y": 66}], visible_enemies=tanks)), CTX)
+    assert b._apc["phase"] == "home"
