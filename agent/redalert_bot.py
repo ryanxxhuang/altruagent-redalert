@@ -92,6 +92,17 @@ RAID_MIN_ARMY = 5           # don't raid with a smaller army at home
 RAID_EVERY_S = 20.0
 RAID_PULLBACK_COOLDOWN_S = 20.0  # no new raid squad this long after one ran home
 RAID_DETOUR = 16            # a raid flanks this many cells to the quieter side of the direct line
+# Hit and run: approach -> strike (briefly, harvesters first) -> withdraw the
+# moment responders arrive -> reset on the other flank -> approach again.
+RAID_STRIKE_S = 10.0        # longest strike before withdrawing anyway
+RAID_RESPONSE_RANGE = 9     # enemy combat units this close to the squad count as responders
+RAID_WITHDRAW_RATIO = 0.6   # withdraw when responders reach this share of the squad's strength
+RAID_SAFE_RANGE = 14        # withdrawn once every enemy combat unit is this far away
+RAID_WITHDRAW_MAX_S = 12.0  # or after this long
+RAID_RESET_S = 10.0         # pause (and top up) before the next approach, on the other flank
+RAID_WITHDRAW_STEP = 16     # cells per withdraw order
+RAID_TARGET_VALUE = {"harv": 10.0, "mcv": 8.0, "arty": 6.0, "v2rl": 6.0, "e1": 1.5, "e3": 1.2, "e6": 2.0,
+                     "medi": 2.0, "jeep": 1.0, "ftrk": 0.8, "apc": 0.6}
 RAID_DANGER_RANGE = 14      # enemies this close to a route point count as danger on it
 HOME_IDLE_MAX_S = 40.0      # an army waiting at home longer than this attacks if not weaker
 # The field commander (an LLM) decides production and army moves; its last
@@ -215,6 +226,10 @@ class RedAlertBot:
         self._raiders: set[int] = set()
         self._raid_target: tuple[int, int] | None = None
         self._raid_side: int | None = None       # which flank the current squad sneaks along
+        self._raid_phase = "approach"            # approach | strike | withdraw | reset
+        self._raid_phase_since = 0.0
+        self._raid_strike_until = 0.0
+        self._raid_info: dict = {}               # what the squad is doing, for the commander
         self._no_queued = False                  # the server refused queued orders
         self._enemy_ore: tuple[int, int] | None = None
         self._enemy_harv_seen: dict[int, tuple[tuple[int, int], float]] = {}
@@ -331,6 +346,7 @@ class RedAlertBot:
             "threat_near_base_strength": round(self._threat),
             "enemy_ore_field": list(self._enemy_ore) if self._enemy_ore else None,
             "raid_squad": len(self._raiders),
+            "raid": self._raid_info,
             "main_idle_seconds": round(self._game_s - self._holding_since) if self._holding_since is not None else 0,
             "idle_combat_units": getattr(self, "_idle_combat", 0),
             "strength_ahead": round(getattr(self, "_ahead", 0)),
@@ -395,8 +411,22 @@ class RedAlertBot:
         theirs, known = self.enemy_army_estimate()
         ratio = f"{ours / theirs:.1f}x" if theirs else ("no enemy army seen" if not known else "their army is gone")
         held = f", main army idle {self._game_s - self._holding_since:.0f}s" if self._holding_since is not None else ""
+        big, cell, age = self.enemy_largest_group()
+        group = ""
+        if cell:
+            eb = getattr(self, "_enemy_base_cache", None)
+            ob = getattr(self, "_base_cell", None)
+            mc = getattr(self, "_main_centre", None)
+            where = (f", {_dist(cell, eb):.0f} cells from their base" if eb else "") + (
+                f", {_dist(cell, ob):.0f} from our base" if ob else "") + (
+                f", {_dist(cell, mc):.0f} from our main army" if mc else "")
+            group = f"; largest enemy group seen: {big:.0f} at {list(cell)} {age:.0f}s ago{where}"
+        if self._raid_info:
+            r = self._raid_info
+            group += (f"; raid squad ({r.get('size')}): {r.get('phase')} at {r.get('at')}, responders {r.get('responders')}"
+                      + (f" ({r.get('responders_from_their_base')} cells from their base)" if r.get("responders") else ""))
         return (f"our army {ours:.0f} vs their known army {theirs:.0f} ({ratio}); at our base {self._threat:.0f}; "
-                f"main army: {self._main_state}{held}; ahead of it {getattr(self, '_ahead', 0):.0f}")
+                f"main army: {self._main_state}{held}; ahead of it {getattr(self, '_ahead', 0):.0f}{group}")
 
     def _llm(self) -> dict | None:
         """The field commander's decision while fresh, else None (rules take over)."""
@@ -481,6 +511,7 @@ class RedAlertBot:
             self._rush_active = False
         self._visible_enemy_buildings = enemy_buildings
         base = self._base(obs, buildings, units)
+        self._base_cell = base
         enemy_base = self._enemy_base(la, base)
         if base and getattr(self, "_our_ore", None) is None and self._config:
             self._our_ore = _ore_near(self._config, base) or False
@@ -881,7 +912,9 @@ class RedAlertBot:
         # Kiting: units that out-run or out-range their attacker run and shoot.
         if time.monotonic() < self._retreat_until:
             return orders, pulled  # retreating: nobody turns back to fight
-        kite_orders, kiting = self._kite(raw, ours, enemies, pulled, base)
+        # A raid squad on its way out is running already: micro leaves it alone.
+        raid_away = set(self._raiders) if self._raid_phase in ("withdraw", "reset") else set()
+        kite_orders, kiting = self._kite(raw, ours, enemies, pulled | raid_away, base)
         if kite_orders:
             orders += kite_orders
             notes.append(f"kiting with {len(kiting)} units")
@@ -901,9 +934,10 @@ class RedAlertBot:
         tcell = _xy(target) if target else None
         if not tcell or not isinstance(target.get("id"), int):
             # No enemy units in the fight: wreck their buildings in the right order.
-            wreck, wreckers = self._focus_structure(ours, controlled, max_units, notes)
+            wreck, wreckers = self._focus_structure(ours, controlled | set(self._raiders), max_units, notes)
             return orders + wreck, controlled | wreckers
-        shooters = [i for i, c in cells.items() if i not in controlled and _dist(c, tcell) <= FOCUS_SHOOTER_RANGE]
+        shooters = [i for i, c in cells.items()
+                    if i not in controlled and i not in self._raiders and _dist(c, tcell) <= FOCUS_SHOOTER_RANGE]
         for chunk in _chunks(shooters, max_units):
             orders.append({"cmd": "attack", "units": chunk, "target": target["id"]})
         if shooters:
@@ -914,16 +948,17 @@ class RedAlertBot:
         # in its reach), never buildings while enemy units are around.
         by_target: dict[int, list[int]] = {}
         for i, c in cells.items():
-            if i in controlled or i in engaged:
+            if i in controlled or i in engaged or i in raid_away:
                 continue
             reach = [e for e in enemies if _xy(e) and isinstance(e.get("id"), int) and _dist(_xy(e), c) <= UNIT_ENGAGE_RANGE]
             if reach:
-                by_target.setdefault(max(reach, key=self._target_score)["id"], []).append(i)
+                score = self._raid_target_score if i in self._raiders else self._target_score
+                by_target.setdefault(max(reach, key=score)["id"], []).append(i)
         for tid, ids in sorted(by_target.items(), key=lambda kv: -len(kv[1]))[:MAX_MICRO_ORDERS]:
             orders.append({"cmd": "attack", "units": ids[:max_units], "target": tid})
             engaged |= set(ids[:max_units])
         # Units with no enemy unit in reach wreck buildings in priority order.
-        wreck, wreckers = self._focus_structure(ours, controlled | engaged, max_units, notes)
+        wreck, wreckers = self._focus_structure(ours, controlled | engaged | set(self._raiders), max_units, notes)
         return orders + wreck, controlled | engaged | wreckers
 
     # -- kiting ----------------------------------------------------------------------------
@@ -972,7 +1007,8 @@ class RedAlertBot:
                 # It stopped or turned back: turn and shoot (best target in range, else it).
                 ru = self._range(u)
                 in_range = [x for x in enemies if _xy(x) and isinstance(x.get("id"), int) and _dist(_xy(x), uc) <= ru + 0.5]
-                key = (max(in_range, key=self._target_score) if in_range else e)["id"]
+                score = self._raid_target_score if uid in self._raiders else self._target_score
+                key = (max(in_range, key=score) if in_range else e)["id"]
                 mode = "fight"
             prev = self._kite_state.get(uid)
             wait = KITE_REISSUE_FLEE if mode == "flee" else KITE_REISSUE_FIGHT
@@ -988,8 +1024,8 @@ class RedAlertBot:
         orders += [{"cmd": "attack", "units": ids, "target": tid} for tid, ids in fight.items()]
         return orders[:KITE_MAX_ORDERS], controlled
 
-    def _flee_cell(self, uc, threat_cells, base, raw) -> tuple[int, int]:
-        """A cell KITE_STEP away from the threats, leaning towards home."""
+    def _flee_cell(self, uc, threat_cells, base, raw, step: int = KITE_STEP) -> tuple[int, int]:
+        """A cell ``step`` away from the threats, leaning towards home."""
         ax = sum((uc[0] - t[0]) / (_dist(uc, t) or 1.0) for t in threat_cells)
         ay = sum((uc[1] - t[1]) / (_dist(uc, t) or 1.0) for t in threat_cells)
         n = math.hypot(ax, ay) or 1.0
@@ -1000,8 +1036,8 @@ class RedAlertBot:
             ax, ay = 0.75 * ax + 0.25 * hx / hn, 0.75 * ay + 0.25 * hy / hn
             n = math.hypot(ax, ay) or 1.0
             ax, ay = ax / n, ay / n
-        x = uc[0] + ax * KITE_STEP
-        y = uc[1] + ay * KITE_STEP
+        x = uc[0] + ax * step
+        y = uc[1] + ay * step
         # Round to a 2-cell grid so a group running together shares one order.
         return self._clamp((int(round(x / 2) * 2), int(round(y / 2) * 2)), raw)
 
@@ -1025,6 +1061,19 @@ class RedAlertBot:
         if len(self._enemy_hist) > 300:
             for eid in [i for i, h in self._enemy_hist.items() if now - h[-1][0] > 10]:
                 del self._enemy_hist[eid]
+
+    def enemy_largest_group(self) -> tuple[float, tuple[int, int] | None, float]:
+        """(strength, cell, seconds ago) of the biggest cluster of enemy combat
+        units seen in the last ENEMY_MEMORY_S seconds (within 12 cells)."""
+        now = time.monotonic()
+        units = [e for e in self._enemy_army.values() if now - e["t"] <= ENEMY_MEMORY_S]
+        best, cell, age = 0.0, None, 0.0
+        for e in units:
+            group = [f for f in units if _dist((e["x"], e["y"]), (f["x"], f["y"])) <= 12]
+            strength = sum(self._strength(f) for f in group)
+            if strength > best:
+                best, cell, age = strength, (e["x"], e["y"]), now - max(f["t"] for f in group)
+        return best, cell, age
 
     def enemy_army_estimate(self) -> tuple[float, bool]:
         """(strength of the enemy army we know of, whether we've seen it lately)."""
@@ -1081,6 +1130,13 @@ class RedAlertBot:
         self._mark("focus")
         notes.append(f"wrecking {target.get('type')} {target['id']}")
         return [{"cmd": "attack", "units": chunk, "target": target["id"]} for chunk in _chunks(shooters, max_units)], set(shooters)
+
+    @staticmethod
+    def _raid_target_score(enemy: dict) -> float:
+        """Raiders hit what hurts the economy and dies fast, never tanks."""
+        value = RAID_TARGET_VALUE.get(str(enemy.get("type", "")).lower(), 0.3)
+        hp = enemy.get("hp") if isinstance(enemy.get("hp"), (int, float)) else 100
+        return value * (1.0 + (100 - hp) / 50.0)
 
     @staticmethod
     def _target_score(enemy: dict) -> float:
@@ -1214,20 +1270,32 @@ class RedAlertBot:
         """Carry out the commander's army orders, with the bot's reflexes:
         micro, home defense against raids, emergency retreat."""
         self._retreat_issued = False
-        micro, controlled = self._micro(raw, army, enemies, staging, base, notes)
-        if self._retreat_issued:
-            return micro
-        orders: list[dict] = []
-        max_units = 50
         alive = {u["id"]: u for u in army if isinstance(u.get("id"), int) and _xy(u)}
         self._our_strength = sum(self._strength(u) for u in alive.values())
 
         def cell(x: int, y: int, default):
             return self._clamp((x, y), raw) if x >= 0 and y >= 0 else default
 
+        # The raid squad's phase comes first: micro leaves a withdrawing squad alone.
+        self._raiders &= set(alive)
+        rtarget = cell(d["raid_x"], d["raid_y"], None) or self._raid_cell(enemy_base) or enemy_base
+        if self._raiders:
+            self._raid_phase_update(rtarget, alive, enemies)
+        micro, controlled = self._micro(raw, army, enemies, staging, base, notes)
+        if self._retreat_issued:
+            return micro
+        orders: list[dict] = []
+        max_units = 50
+        # Enemies at our base (home units fight them by reflex; raids wait).
+        building_cells = [c for c in (_xy(b) for b in buildings) if c]
+        threats = [e for e in enemies if _xy(e) and (
+            (base and _dist(_xy(e), base) <= BASE_RADIUS)
+            or any(_dist(_xy(e), bc) <= BUILDING_THREAT_RADIUS for bc in building_cells))]
+        self._threat = sum(self._strength(e) for e in threats)
+
         # Raid squad: the size the commander chose, at least the general's
         # standing raid (unless enemies are at our base and everyone is needed).
-        self._raiders &= set(alive)
+        before = set(self._raiders)
         size = d["raid_size"]
         standing = int(self.knobs.get("standing_raid", 0) or 0)
         if standing > size and self._threat <= 0 and len(alive) >= standing + 4:
@@ -1239,7 +1307,10 @@ class RedAlertBot:
         elif len(self._raiders) > size:
             for uid in sorted(self._raiders)[size:]:
                 self._raiders.discard(uid)
-        elif len(self._raiders) < size and not self._recent("raid_pullback", RAID_PULLBACK_COOLDOWN_S):
+        elif len(self._raiders) < size and self._raid_phase in ("approach", "reset") \
+                and not self._recent("raid_pullback", RAID_PULLBACK_COOLDOWN_S):
+            if not self._raiders:
+                self._raid_phase, self._raid_phase_since = "approach", time.monotonic()
             spare = [u for i, u in alive.items() if i not in self._raiders and u.get("idle")]
             want = str(d.get("raid_unit") or "").lower()
             if want:
@@ -1255,32 +1326,16 @@ class RedAlertBot:
                 spare.sort(key=self._speed, reverse=True)
             self._raiders |= {u["id"] for u in spare[: size - len(self._raiders)]}
         if self._raiders:
-            rtarget = cell(d["raid_x"], d["raid_y"], None) or self._raid_cell(enemy_base)
-            squad = [alive[i] for i in self._raiders]
-            ours_s, theirs_s = self._local_strength(squad, enemies)
-            if theirs_s > ours_s * 1.2 and staging:
-                # Reflex: an outgunned raid runs home; no new squad for a while,
-                # so the commander doesn't feed units one by one.
-                orders.append({"cmd": "move", "units": sorted(self._raiders), "to": list(staging)})
-                self.log(f"[bot] raid outgunned ({ours_s:.0f} vs {theirs_s:.0f}), pulling back")
-                self._problem(f"raid pulled back: outgunned near {list(rtarget) if rtarget else '?'} "
-                              f"({ours_s:.0f} vs {theirs_s:.0f}); no new squad for {RAID_PULLBACK_COOLDOWN_S:.0f}s")
-                self._mark("raid_pullback")
-                self._raiders.clear()
-            elif rtarget and not self._recent("raid", 4.0):
-                ids = [i for i in self._raiders if i not in controlled]
-                if ids:
-                    orders += self._raid_orders(ids[:max_units], squad, rtarget, raw)
-                    self._mark("raid")
+            if self._raiders != before:
+                self._raid_phase_update(rtarget, alive, enemies)  # a new or changed squad: its phase now
+            orders += self._run_raid(rtarget, alive, enemies, enemy_base, staging, raw, controlled)
+        else:
+            self._raid_info = {}
 
         main = [u for i, u in alive.items() if i not in self._raiders]
         self._idle_combat = sum(1 for u in main if u.get("idle"))
+        self._main_centre = self._centroid([_xy(u) for u in main]) if main else None
         # Reflex: enemies at our base are fought by whoever is home.
-        building_cells = [c for c in (_xy(b) for b in buildings) if c]
-        threats = [e for e in enemies if _xy(e) and (
-            (base and _dist(_xy(e), base) <= BASE_RADIUS)
-            or any(_dist(_xy(e), bc) <= BUILDING_THREAT_RADIUS for bc in building_cells))]
-        self._threat = sum(self._strength(e) for e in threats)
         home = [u for u in main if base and _dist(_xy(u), base) <= 20]
         if threats and home and not self._recent("home_defense", 2.0):
             spot = min((_xy(e) for e in threats), key=lambda c: _dist(c, base))
@@ -1546,6 +1601,85 @@ class RedAlertBot:
         self._mark("raid")
         notes.append(f"raiding enemy harvesters at {target}")
         self.log(f"[bot] raid: {len(self._raiders)} units to {target}")
+        return orders
+
+    def _raid_view(self, alive: dict[int, dict], enemies: list[dict]):
+        squad = [alive[i] for i in self._raiders if i in alive and _xy(alive[i])]
+        if not squad:
+            return None
+        centre = self._centroid([_xy(u) for u in squad])
+        combat_foes = [e for e in enemies if _xy(e) and self._is_combat(e)]
+        near_foes = [e for e in combat_foes if _dist(_xy(e), centre) <= RAID_RESPONSE_RANGE]
+        responders = sum(self._strength(e) for e in near_foes)
+        squad_s = sum(self._strength(u) for u in squad) or 1.0
+        return squad, centre, combat_foes, near_foes, responders, squad_s
+
+    def _raid_phase_update(self, target, alive: dict[int, dict], enemies: list[dict]) -> None:
+        """Hit and run. The squad approaches along a flank, strikes briefly
+        (harvesters first), withdraws the moment responders arrive, resets on
+        the other flank and goes again. It never fights to the end."""
+        view = self._raid_view(alive, enemies)
+        if view is None or not target:
+            return
+        squad, centre, combat_foes, near_foes, responders, squad_s = view
+        now = time.monotonic()
+        phase = self._raid_phase
+        if phase == "approach":
+            if _dist(centre, target) <= 8:
+                phase, self._raid_strike_until = "strike", now + RAID_STRIKE_S
+            elif responders >= RAID_WITHDRAW_RATIO * squad_s:
+                phase = "withdraw"  # intercepted on the way in
+        if phase == "strike" and (responders >= RAID_WITHDRAW_RATIO * squad_s or now >= self._raid_strike_until):
+            phase = "withdraw"
+        if phase == "withdraw":
+            clear = all(_dist(_xy(e), centre) > RAID_SAFE_RANGE for e in combat_foes)
+            if clear or now - self._raid_phase_since > RAID_WITHDRAW_MAX_S:
+                phase = "reset"
+        if phase == "reset" and now - self._raid_phase_since >= RAID_RESET_S:
+            phase = "approach"
+            self._raid_side = -(self._raid_side or 1)  # the other flank this time
+        if phase != self._raid_phase:
+            self._raid_phase, self._raid_phase_since = phase, now
+            self.log(f"[bot] raid: {phase} ({len(squad)} units at {list(centre)}, responders {responders:.0f} vs {squad_s:.0f})")
+        eb = getattr(self, "_enemy_base_cache", None)
+        self._raid_info = {
+            "size": len(squad), "phase": phase, "at": list(centre), "target": list(target),
+            "responders": round(responders),
+            "responders_from_their_base": round(min(_dist(_xy(e), eb) for e in near_foes)) if near_foes and eb else None,
+        }
+
+    def _run_raid(self, target, alive: dict[int, dict], enemies: list[dict], enemy_base, staging, raw: dict,
+                  controlled: set[int]) -> list[dict]:
+        """The squad's orders for its current phase (see _raid_phase_update)."""
+        view = self._raid_view(alive, enemies)
+        if view is None or not target:
+            return []
+        squad, centre, combat_foes, near_foes, responders, squad_s = view
+        phase = self._raid_phase
+        ids = [i for i in sorted(self._raiders) if i not in controlled]
+        if not ids:
+            return []
+        orders: list[dict] = []
+        if phase == "approach":
+            if not self._recent("raid", 4.0):
+                orders += self._raid_orders(ids, squad, target, raw)
+                self._mark("raid")
+        elif phase == "strike":
+            if not self._recent("raid", 2.0):
+                orders.append({"cmd": "attack_move", "units": ids, "to": list(target)})
+                self._mark("raid")
+        else:  # withdraw / reset: get away from the responders, towards home
+            if not self._recent("raid_withdraw", 3.0):
+                threats = [_xy(e) for e in (near_foes or combat_foes)]
+                if threats:
+                    dest = self._flee_cell(centre, threats, staging or getattr(self, "_base_cell", None), raw, RAID_WITHDRAW_STEP)
+                elif staging and _dist(centre, staging) > 10:
+                    dest = self._toward(centre, staging, 12, raw)
+                else:
+                    dest = None
+                if dest:
+                    orders.append({"cmd": "move", "units": ids, "to": list(dest)})
+                    self._mark("raid_withdraw")
         return orders
 
     def _raid_route(self, start, target, raw: dict) -> list[tuple[int, int]]:

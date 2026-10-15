@@ -603,19 +603,16 @@ def test_scout_is_the_cheapest_unit_and_raid_unit_is_honoured():
     assert b2._raiders == {102}
 
 
-def test_outgunned_raid_is_not_refilled_for_a_while():
+def test_outgunned_raid_withdraws_instead_of_fighting():
     units = [{"id": 100 + i, "type": "e1", "x": 60, "y": 60, "idle": True, "hp": 100} for i in range(3)]
     foes = [{"id": 900 + i, "type": "3tnk", "x": 62, "y": 60, "hp": 100} for i in range(4)]
-    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 2, "raid_x": 62, "raid_y": 60}))
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 2, "raid_x": 80, "raid_y": 60}))
     b.choose_action(_state(_base_obs(units=units)), CTX)   # squad formed
     assert len(b._raiders) == 2
-    b._sent.pop("raid", None)
-    b.choose_action(_state(_base_obs(units=units, visible_enemies=foes)), CTX)   # outgunned: runs home
-    assert not b._raiders and any("raid pulled back" in p for p in b.status()["problems"])
-    b.choose_action(_state(_base_obs(units=units, visible_enemies=foes)), CTX)   # not re-formed yet
-    assert not b._raiders
-
-
+    b._sent.clear()
+    orders = _orders(b.choose_action(_state(_base_obs(units=units, visible_enemies=foes)), CTX))
+    assert b._raid_phase == "withdraw" and len(b._raiders) == 2  # runs, stays a squad
+    assert any(o["cmd"] == "move" and set(o["units"]) == b._raiders and o["to"][0] < 60 for o in orders)
 def test_reinforcements_at_home_do_not_hold_the_front_group_back():
     front = [{"id": 100 + i, "type": "3tnk", "x": 60, "y": 60, "idle": True, "hp": 100} for i in range(4)]
     home = [{"id": 200 + i, "type": "3tnk", "x": 27, "y": 27, "idle": True, "hp": 100} for i in range(6)]
@@ -723,3 +720,56 @@ def test_carrying_on_past_an_empty_target_sticks_despite_a_stray_enemy():
     b._sent.clear()
     b.choose_action(_state(_base_obs(units=army, visible_enemies=stray)), CTX)
     assert b._onward == (78, 78)  # a stray rifleman does not reset it
+
+
+def test_situation_reports_the_largest_enemy_group_seen():
+    import time as _t
+    b = bot()
+    b.rules = {"3tnk": {"cost": 1150}, "e1": {"cost": 100}}
+    now = _t.monotonic()
+    b._enemy_army = {900 + i: {"type": "3tnk", "hp": 100, "x": 70, "y": 70, "t": now} for i in range(3)}
+    b._enemy_army[950] = {"type": "e1", "hp": 100, "x": 20, "y": 20, "t": now}
+    b._enemy_army_seen_at = now
+    strength, cell, _ = b.enemy_largest_group()
+    assert strength == 3450 and cell == (70, 70)
+    assert "largest enemy group seen: 3450 at [70, 70]" in b._situation()
+
+
+def test_raid_hit_and_run_cycle():
+    import time as _t
+    from agent import redalert_bot as rb
+    squad = [{"id": 100 + i, "type": "ftrk", "x": 72, "y": 72, "idle": True, "hp": 100} for i in range(3)]
+    harv = [{"id": 800, "type": "harv", "x": 74, "y": 73, "hp": 100}]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 3, "raid_x": 74, "raid_y": 73}))
+    b.rules = {"ftrk": {"cost": 600, "speed": 2.76}, "3tnk": {"cost": 1150}, "harv": {"cost": 1100}}
+    b.choose_action(_state(_base_obs(units=squad, visible_enemies=harv)), CTX)
+    assert b._raiders == {100, 101, 102} and b._raid_phase == "strike"  # at the target: strike
+    # Their tanks respond: withdraw, away from them and towards home.
+    tanks = [{"id": 900 + i, "type": "3tnk", "x": 78, "y": 72, "hp": 100} for i in range(2)]
+    b._sent.clear()
+    orders = _orders(b.choose_action(_state(_base_obs(units=squad, visible_enemies=harv + tanks)), CTX))
+    assert b._raid_phase == "withdraw"
+    run = [o for o in orders if o["cmd"] == "move" and set(o["units"]) == {100, 101, 102}]
+    assert run and run[0]["to"][0] < 72
+    # Clear of them: reset, then after the pause approach again on the other flank.
+    side = b._raid_side
+    b._sent.clear()
+    b.choose_action(_state(_base_obs(units=squad)), CTX)
+    assert b._raid_phase == "reset"
+    b._raid_phase_since -= rb.RAID_RESET_S + 1
+    b._sent.clear()
+    b._enemy_army = {}  # nothing remembered on either flank: the other flank is taken
+    b.choose_action(_state(_base_obs(units=[{**u, "x": 50, "y": 50} for u in squad])), CTX)
+    assert b._raid_phase == "approach" and b._raid_side == -(side or 1)
+    assert b.status()["raid"]["phase"] == "approach"
+
+
+def test_raiders_shoot_harvesters_not_tanks():
+    squad = [{"id": 100 + i, "type": "ftrk", "x": 72, "y": 72, "idle": True, "hp": 100} for i in range(3)]
+    foes = [{"id": 800, "type": "harv", "x": 75, "y": 72, "hp": 100}, {"id": 900, "type": "3tnk", "x": 74, "y": 74, "hp": 40}]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 3, "raid_x": 75, "raid_y": 72}))
+    b.rules = {"ftrk": {"cost": 600, "speed": 2.76}, "3tnk": {"cost": 1150}, "harv": {"cost": 1100}}
+    b._raiders = {100, 101, 102}
+    orders = _orders(b.choose_action(_state(_base_obs(units=squad, visible_enemies=foes)), CTX))
+    shots = [o for o in orders if o["cmd"] == "attack" and set(o["units"]) & {100, 101, 102}]
+    assert shots and all(o["target"] == 800 for o in shots)
