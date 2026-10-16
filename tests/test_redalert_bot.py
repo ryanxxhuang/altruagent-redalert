@@ -1138,7 +1138,7 @@ def test_a_losing_trade_is_broken_off_and_reported():
     st2 = _state(obs2); st2.raw["time"]["game_seconds"] = 320
     b._sent.clear()
     orders = _orders(b.choose_action(st2, CTX))
-    assert not b._attacking and "broke off" in b.status()["main_state"]
+    assert not b._attacking and "losing the trade" in b.status()["main_state"]
     assert any(o["cmd"] == "move" for o in orders)
     assert "TRADE kills 1400 - deaths 4500 = -3100" in b._situation()
     # Cooling off: an attack order holds at the edge instead of re-engaging.
