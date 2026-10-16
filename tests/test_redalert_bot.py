@@ -1687,3 +1687,20 @@ def test_home_guard_and_defend_stay_under_the_towers_during_a_gate_fight():
     b._sent.clear()
     orders = _orders(b.choose_action(_state(obs), CTX))
     assert any(o["cmd"] == "attack_move" and o["to"] == [44, 30] for o in orders)
+
+
+def test_home_guard_backs_off_from_a_much_stronger_force_instead_of_standing():
+    import time as _t
+    gun = {"id": 7, "type": "gun", "x": 30, "y": 24}
+    guard = [{"id": 100 + i, "type": "2tnk", "x": 34 + (i % 2), "y": 26, "idle": True, "hp": 100} for i in range(3)]
+    ball = [{"id": 900 + i, "type": "3tnk", "x": 38, "y": 26 + (i % 4), "hp": 100} for i in range(10)]  # 11,500 vs 2,550, at our gun
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "defend"}))
+    b.rules = {"2tnk": {"cost": 850, "speed": 1.76}, "3tnk": {"cost": 1150, "speed": 1.56}, "gun": {"cost": 800}}
+    obs = _base_obs(units=guard, visible_enemies=ball)
+    obs["buildings"].append(gun)
+    b._enemy_hist = {900 + i: __import__("collections").deque([(_t.monotonic(), (42, 26 + i % 4))], maxlen=10) for i in range(10)}
+    orders = _orders(b.choose_action(_state(obs), CTX))
+    assert "backing off" in b.status()["main_state"]
+    back = [o for o in orders if o["cmd"] == "move" and set(o["units"]) & {100, 101, 102}]
+    assert back and all(o["to"][0] < 34 for o in back)  # away from them, towards the gun
+    assert orders[-1]["cmd"] == "move"  # the back-off is the last word, after micro's focus fire

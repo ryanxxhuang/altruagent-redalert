@@ -1701,6 +1701,8 @@ class RedAlertBot:
         micro, home defense against raids, emergency retreat."""
         self._retreat_issued = False
         self._party_back: list[dict] = []
+        self._backoff: list[dict] = []  # few-vs-many back-off moves: issued last, they beat focus fire
+        self._guard_fight = False
         alive = {u["id"]: u for u in army if isinstance(u.get("id"), int) and _xy(u)}
         trucks = [u for u in alive.values() if str(u.get("type", "")).lower() in SUICIDE_TYPES]
         truck_ids = {u["id"] for u in trucks}
@@ -1838,11 +1840,22 @@ class RedAlertBot:
             chosen = cell(d["main_x"], d["main_y"], None) if d["main_action"] == "defend" else None
             spot = self._gate_spot(chosen, commanded=True) if chosen else \
                 self._gate_spot(min((_xy(e) for e in threats), key=lambda c: _dist(c, base)))
-            ids = [u["id"] for u in home if u["id"] not in controlled]
-            for chunk in _chunks(ids, max_units):
-                orders.append({"cmd": "attack_move", "units": chunk, "to": list(spot)})
+            # The doctrine applies at home too: few vs many backs off towards the
+            # towers instead of standing still (tournament game 1: 20 tanks stood
+            # under the turrets while 43 units and V2s ate them); many vs few surrounds.
+            g_ours, g_theirs = self._local_strength(home, enemies)
+            fight = None
+            if g_theirs > 0 and g_ours < HARASS_RATIO * g_theirs:
+                fight = self._doctrine(raw, home, enemies, staging, g_ours, g_theirs, notes)  # few vs many: never stand still
+            self._guard_fight = bool(fight)
+            if fight:
+                orders += fight
+            else:
+                ids = [u["id"] for u in home if u["id"] not in controlled]
+                for chunk in _chunks(ids, max_units):
+                    orders.append({"cmd": "attack_move", "units": chunk, "to": list(spot)})
+                notes.append(f"home units fight {len(threats)} raiders at the base")
             self._mark("home_defense")
-            notes.append(f"home units fight {len(threats)} raiders at the base")
         busy_home = {u["id"] for u in home} if threats else set()
 
         action = d["main_action"]
@@ -1995,7 +2008,8 @@ class RedAlertBot:
                 for chunk in _chunks([u["id"] for u in force], max_units):
                     orders.append({"cmd": "attack_move", "units": chunk, "to": list(spot)})
                 self._mark("defend_cmd")
-            self._main_state = f"defending at {list(spot) if spot else '?'}"
+            if not self._guard_fight:
+                self._main_state = f"defending at {list(spot) if spot else '?'}"
 
         # Micro last wins; units it controls are left out of the orders above.
         kept = []
@@ -2007,7 +2021,7 @@ class RedAlertBot:
                 order = {**order, "units": ids}
             kept.append(order)
         # The advance party's fall-back and the demo trucks' orders go last: they beat micro for those units.
-        return kept + micro + self._party_back + getattr(self, "_truck_orders", [])
+        return kept + micro + self._party_back + getattr(self, "_truck_orders", []) + self._backoff
 
     def _demo_trucks(self, trucks: list[dict], staging) -> list[dict]:
         """Demolition trucks (Ukraine) ride ALONE at the priciest known enemy
@@ -2203,6 +2217,7 @@ class RedAlertBot:
                 home = _xy(g["tower"]) if g is not None else (staging or getattr(self, "_base_cell", None))
                 dest = self._flee_cell(centre, [_xy(e) for e in coming], home, raw, HARASS_STEP)
                 orders = [{"cmd": "move", "units": chunk, "to": list(dest)} for chunk in _chunks(ids, 50)]
+                self._backoff = list(orders)  # repeated after micro so no unit stays to shoot while the group runs
                 mode = f"few vs many ({ratio:.1f}x): backing off while they come on"
             else:
                 # They stopped: shoot from where we stand (micro picks targets);
