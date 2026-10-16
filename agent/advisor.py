@@ -111,7 +111,8 @@ defensive (more static defenses, bigger waves).
 - build_targets: up to 4 {item, count} the bot reaches FIRST, before anything else, e.g. [{"item": "proc", \
 "count": 2}, {"item": "harv", "count": 4}]. Walk the tech ladder as soon as 4+ harvesters are mining (the OWNER'S STANDING ORDER: use as much high tech as the \
 economy allows; never put dome/stek/atek on avoid while 4+ harvesters mine): dome, then stek/atek with an apwr, then 4tnk/v2rl/ttnk/shok/dtrk/dogs (Soviets) or \
-arty/ctnk/stnk/e7 (Allies), plus a 3rd proc; never aircraft, ships or superweapons (the bot cannot use them). The \
+arty/ctnk/stnk/e7 (Allies), plus a 3rd proc; never aircraft, ships or superweapons (the bot cannot use them). After 10:00 with the tech up, \
+build_targets lead with the top units (4tnk/ttnk/v2rl/dtrk or arty/ctnk/stnk/e7), not more basic tanks. The \
 situation line says "tech: ... next: ...". Counts are totals you want to own (buildings or units); names from \
 available_production / my_buildings / my_units. [] to leave it alone. The bot keeps power positive by itself.
 - avoid: items the bot must not build or train until your next call, e.g. ["dome"] to save money. [] for none. \
