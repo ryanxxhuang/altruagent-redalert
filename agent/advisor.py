@@ -109,8 +109,8 @@ defensive (more static defenses, bigger waves).
 - unit_focus: tanks, infantry, mixed, anti_armor (more rocket infantry).
 - defenses: static defenses to keep (0-6). max_refineries: 1-5.
 - build_targets: up to 4 {item, count} the bot reaches FIRST, before anything else, e.g. [{"item": "proc", \
-"count": 2}, {"item": "harv", "count": 4}]. Walk the tech ladder as soon as 5+ harvesters are mining (the owner wants \
-the high-tech arsenal used): dome, then stek/atek with an apwr, then 4tnk/v2rl/ttnk/shok/dtrk/dogs (Soviets) or \
+"count": 2}, {"item": "harv", "count": 4}]. Walk the tech ladder as soon as 4+ harvesters are mining (the OWNER'S STANDING ORDER: use as much high tech as the \
+economy allows; never put dome/stek/atek on avoid while 4+ harvesters mine): dome, then stek/atek with an apwr, then 4tnk/v2rl/ttnk/shok/dtrk/dogs (Soviets) or \
 arty/ctnk/stnk/e7 (Allies), plus a 3rd proc; never aircraft, ships or superweapons (the bot cannot use them). The \
 situation line says "tech: ... next: ...". Counts are totals you want to own (buildings or units); names from \
 available_production / my_buildings / my_units. [] to leave it alone. The bot keeps power positive by itself.
