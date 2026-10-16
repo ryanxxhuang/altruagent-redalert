@@ -100,6 +100,7 @@ RAID_ALERT_RANGE = 13       # ... and these, if they are coming at us
 RAID_WITHDRAW_RATIO = 0.35  # withdraw when responders reach this share of the squad's strength
 RAID_HURT_SHARE = 0.05      # ... or when the squad has lost this share of its hp since the strike began
 RAID_BUILD_CAP = 4          # raid vehicles the bot replaces per match on its own
+RAID_PREY_RANGE = 14        # a harvester this close to the squad is attacked at once, whatever else is around
 RAID_LOSS_WINDOW_S = 180.0  # losing RAID_LOSS_MAX raiders within this ...
 RAID_LOSS_MAX = 2
 RAID_PAUSE_S = 120.0        # ... pauses raids (and replacements) this long
@@ -1058,8 +1059,8 @@ class RedAlertBot:
         # in its reach), never buildings while enemy units are around.
         by_target: dict[int, list[int]] = {}
         for i, c in cells.items():
-            if i in controlled or i in engaged or i in raid_away:
-                continue
+            if i in controlled or i in engaged or i in raid_away or i in self._raiders:
+                continue  # raiders hunt harvesters on their own (see _run_raid)
             reach = [e for e in enemies if _xy(e) and isinstance(e.get("id"), int) and _dist(_xy(e), c) <= UNIT_ENGAGE_RANGE]
             if reach:
                 score = self._raid_target_score if i in self._raiders else self._target_score
@@ -2025,14 +2026,16 @@ class RedAlertBot:
             if self._raid_hp_start <= 0 or hp > self._raid_hp_start:
                 self._raid_hp_start = hp
             hurt_on_way = hp < self._raid_hp_start * (1 - RAID_HURT_SHARE)
-            if _dist(centre, target) <= 8:
+            prey_near = any(_xy(e) and str(e.get("type", "")).lower() == "harv" and _dist(_xy(e), centre) <= RAID_PREY_RANGE
+                            for e in enemies)
+            if _dist(centre, target) <= 8 or (prey_near and responders == 0):
                 phase, self._raid_strike_until, self._raid_hp_start = "strike", now + RAID_STRIKE_S, hp
             elif threatened or hurt_on_way:
                 phase = "withdraw"  # intercepted (or shot at) on the way in
         if phase == "strike":
             hurt = self._raid_hp_start > 0 and hp < self._raid_hp_start * (1 - RAID_HURT_SHARE)
             # Many vs few: nobody defending and prey in reach -> finish it off.
-            prey = any(_xy(e) and _dist(_xy(e), centre) <= 10 and not self._is_combat(e) for e in enemies)
+            prey = any(_xy(e) and _dist(_xy(e), centre) <= RAID_PREY_RANGE and not self._is_combat(e) for e in enemies)
             unopposed = responders == 0 and prey and now < self._raid_strike_until - RAID_STRIKE_S + RAID_STRIKE_MAX_S
             if threatened or hurt or (now >= self._raid_strike_until and not unopposed):
                 phase = "withdraw"
@@ -2086,7 +2089,15 @@ class RedAlertBot:
                 orders += self._raid_orders(ids, squad, target, raw)
                 self._mark("raid")
         elif phase == "strike":
-            if not self._recent("raid", 2.0):
+            prey = [e for e in enemies if _xy(e) and isinstance(e.get("id"), int)
+                    and str(e.get("type", "")).lower() == "harv" and _dist(_xy(e), centre) <= RAID_PREY_RANGE]
+            if prey:
+                if not self._recent("raid_shot", 1.5):
+                    hp_of = lambda e: e.get("hp") if isinstance(e.get("hp"), (int, float)) else 100  # noqa: E731
+                    mark = min(prey, key=lambda e: (hp_of(e), _dist(_xy(e), centre)))
+                    orders.append({"cmd": "attack", "units": ids, "target": mark["id"]})
+                    self._mark("raid_shot")
+            elif not self._recent("raid", 2.0):
                 orders.append({"cmd": "attack_move", "units": ids, "to": list(target)})
                 self._mark("raid")
         else:  # withdraw / reset: get away from the responders, towards home

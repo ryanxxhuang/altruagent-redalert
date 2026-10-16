@@ -1110,3 +1110,15 @@ def test_situation_shows_the_tech_ladder():
     assert "next: dome" in b._situation()
     b._btypes["dome"] = 1
     assert "next: tech centre" in b._situation()
+
+
+def test_raiders_hunt_the_harvester_and_ignore_the_rifleman_next_to_them():
+    squad = [{"id": 100 + i, "type": "jeep", "x": 60, "y": 60, "idle": True, "hp": 100} for i in range(3)]
+    foes = [{"id": 800, "type": "harv", "x": 70, "y": 60, "hp": 70},
+            {"id": 801, "type": "harv", "x": 72, "y": 64, "hp": 100}]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 3, "raid_x": 85, "raid_y": 60}))
+    b.rules = {"jeep": {"cost": 500, "speed": 4.0}, "harv": {"cost": 1100}}
+    orders = _orders(b.choose_action(_state(_base_obs(units=squad, visible_enemies=foes)), CTX))
+    assert b._raid_phase == "strike"  # a harvester in reach on the way: strike now
+    shots = [o for o in orders if o["cmd"] == "attack" and set(o["units"]) == {100, 101, 102}]
+    assert shots and shots[-1]["target"] == 800  # the weaker harvester, by direct order
