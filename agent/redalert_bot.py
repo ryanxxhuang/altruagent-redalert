@@ -110,6 +110,11 @@ RAID_HOME_S = 45.0          # two empty strikes in a row: the squad waits at hom
 RAID_HOT_CELL = 10          # ... as a block this many cells across
 RAID_BUILDING_PRIORITY = {"powr": 0, "apwr": 0, "proc": 1, "silo": 2, "weap": 3, "barr": 3, "tent": 3, "dome": 4,
                           "fix": 4, "stek": 5, "atek": 5}
+# Economy floor (decision order #1): 2 harvesters per refinery before any other
+# vehicle; the 2nd refinery by 2:00 and the 3rd by 6:00 when the money is there.
+HARV_PER_PROC = 2
+HARV_CAP = 8
+PROC_SCHEDULE = ((2, 0.0), (3, 300.0))   # (refineries wanted, from game second)
 # LLM authority: the LLM commands; the bot's own strategic guards (raid floor,
 # counter-build, tech block, ambush refusal, escalating cool-off) only advise.
 LLM_AUTHORITY = os.environ.get("LLM_AUTHORITY", "1") not in ("0", "false", "no")
@@ -507,7 +512,7 @@ class RedAlertBot:
         keeps happening (an army that is crushed every minute must stop)."""
         now = time.monotonic()
         self._trade_breaks = [t for t in self._trade_breaks if now - t < 300] + [now]
-        cool = TRADE_COOLDOWN_S if LLM_AUTHORITY else min(TRADE_COOLDOWN_S * (2 ** (len(self._trade_breaks) - 1)), TRADE_COOLDOWN_MAX_S)
+        cool = min(TRADE_COOLDOWN_S * (2 ** (len(self._trade_breaks) - 1)), TRADE_COOLDOWN_MAX_S)
         self._trade_broken_until = now + cool
         self._attacking = False
         self._pincer = None
@@ -745,7 +750,14 @@ class RedAlertBot:
 
         # 3. Build order (Building queue: one at a time).
         if has_yard and "Building" not in busy_queues and not self._recent("build", 1.0):
-            if d and d["build"] != "auto":
+            # Economy floor: refineries on schedule come before the commander's building.
+            wanted_proc = max((n for n, t in PROC_SCHEDULE if self._game_s >= t), default=0)
+            item = None
+            if btypes["proc"] + queued["proc"] < wanted_proc and "proc" in available and not self._blocked_now("proc") \
+                    and money >= 1400 and self._threat <= 0 and btypes["powr"] + btypes["apwr"] > 0:
+                item = "proc"
+                notes.append(f"economy floor: refinery {btypes['proc'] + 1}/{wanted_proc}")
+            elif d and d["build"] != "auto":
                 item = self._commanded("build", d, available, power_margin, queued)
             else:
                 item = self._next_building(btypes, queued, available, money, power_margin, econ, raw)
@@ -976,6 +988,16 @@ class RedAlertBot:
                     self._raid_built += 1
                     busy = busy | {"Vehicle"}
                     notes.append(f"training {item} for the raid squad ({self._raid_built}/{RAID_BUILD_CAP})")
+        # Economy floor: harvesters cover the refineries before any other vehicle.
+        want_harv = min(HARV_PER_PROC * max(have["proc"], 1), HARV_CAP)
+        if d and have["proc"] and len(harvesters) + queued["harv"] < want_harv \
+                and "Vehicle" not in busy and "harv" in available and not self._blocked_now("harv") \
+                and not self._recent("vehicle", 0.8):
+            orders.append({"cmd": "train", "item": "harv", "count": 1})
+            self._mark("vehicle")
+            busy = busy | {"Vehicle"}
+            handled.add("Vehicle")
+            notes.append(f"economy floor: harvester {len(harvesters) + queued['harv'] + 1}/{want_harv}")
         # Counter their composition: more tanks than ours -> tanks and rockets,
         # whatever else was asked (harvesters still come first).
         om = self.opponent_model()

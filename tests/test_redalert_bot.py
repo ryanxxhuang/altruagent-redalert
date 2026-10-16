@@ -59,7 +59,7 @@ def test_builds_power_then_barracks():
     obs["buildings"].append({"id": 2, "type": "powr", "x": 22, "y": 20})
     obs["economy"].update(power_provided=100, power_drained=0)
     b._sent.clear()
-    assert {"cmd": "build", "item": "barr"} in _orders(b.choose_action(_state(obs), CTX))
+    assert {"cmd": "build", "item": "proc"} in _orders(b.choose_action(_state(obs), CTX))  # economy first
 
 
 def test_places_ready_building_and_trains():
@@ -355,7 +355,7 @@ def test_group_waits_for_stragglers_and_holds_when_outnumbered_ahead(monkeypatch
 
 def test_strategy_build_targets_and_avoid_are_obeyed():
     b = bot()
-    b.knobs.update(build_targets=[("proc", 2), ("harv", 3)], avoid=["fix"])
+    b.knobs.update(build_targets=[("proc", 3), ("harv", 6)], avoid=["fix"])
     obs = _obs(buildings=[{"id": 1, "type": "fact", "x": 20, "y": 20}, {"id": 2, "type": "powr", "x": 22, "y": 20},
                           {"id": 3, "type": "barr", "x": 24, "y": 20}, {"id": 4, "type": "proc", "x": 26, "y": 20},
                           {"id": 5, "type": "weap", "x": 28, "y": 20}],
@@ -381,10 +381,11 @@ class FakeCommander(FakeCommanders):
 
 
 def _base_obs(units=(), **kw):
+    # A settled economy (2 refineries, 4 harvesters) so the economy floor is quiet.
     obs = _obs(buildings=[{"id": 1, "type": "fact", "x": 20, "y": 20}, {"id": 2, "type": "powr", "x": 22, "y": 20},
                           {"id": 3, "type": "barr", "x": 24, "y": 20}, {"id": 4, "type": "proc", "x": 26, "y": 20},
-                          {"id": 5, "type": "weap", "x": 28, "y": 20}],
-               units=[{"id": 50, "type": "harv", "x": 30, "y": 30}, *units],
+                          {"id": 5, "type": "weap", "x": 28, "y": 20}, {"id": 6, "type": "proc", "x": 26, "y": 24}],
+               units=[{"id": 50 + i, "type": "harv", "x": 30, "y": 30 + i} for i in range(4)] + list(units),
                available_production=["powr", "proc", "fix", "dome", "ftur", "harv", "3tnk", "e1", "e3"], **kw)
     obs["economy"].update(power_provided=200, power_drained=100)
     return obs
@@ -477,7 +478,7 @@ def test_commander_repeat_before_seeing_the_start_is_not_a_second_copy():
 def test_general_targets_fill_the_gap_between_commander_orders():
     fake = FakeCommander({"build": "dome", "seq": 1})
     b = RedAlertBot(log=lambda m: None, advisor=fake)
-    b.knobs["build_targets"] = [("proc", 2)]
+    b.knobs["build_targets"] = [("proc", 3)]
     b.choose_action(_state(_base_obs()), CTX)  # dome done for decision 1
     b._sent.clear()
     assert {"cmd": "build", "item": "proc"} in _orders(b.choose_action(_state(_base_obs()), CTX))
@@ -1225,7 +1226,8 @@ def test_raid_vehicles_wait_for_the_economy():
     units = [{"id": 100 + i, "type": "e3", "x": 40, "y": 40, "idle": True, "hp": 100} for i in range(4)]
     b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 2, "raid_unit": "ftrk", "vehicle": "harv"}))
     b.rules = {"ftrk": {"cost": 600, "speed": 2.76}, "harv": {"cost": 1100, "speed": 1.76}, "e3": {"cost": 300, "speed": 1.32}}
-    obs = _base_obs(units=units)  # 1 harvester, 1 refinery
+    obs = _base_obs(units=units)
+    obs["units"] = [u for u in obs["units"] if u["type"] != "harv"] + [{"id": 50, "type": "harv", "x": 30, "y": 30}]  # 1 harvester
     obs["available_production"] = obs["available_production"] + ["ftrk"]
     orders = _orders(b.choose_action(_state(obs), CTX))
     assert not any(o["cmd"] == "train" and o["item"] == "ftrk" for o in orders)  # harvesters first
@@ -1320,11 +1322,30 @@ def test_no_many_vs_few_chase_into_their_base_through_the_fog():
     one = [{"id": 900, "type": "3tnk", "x": 66, "y": 62, "hp": 100}]  # one tank in view, by their base
     b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 80}))
     b.rules = {"3tnk": {"cost": 1150, "speed": 1.56}, "tsla": {"cost": 1200}}
-    b._enemy_base_cache = (72, 70)
     now = _t.monotonic()
-    b._enemy_army = {900 + i: {"type": "3tnk", "hp": 100, "x": 74, "y": 72, "t": now} for i in range(7)}  # 8,050 known
+    b._enemy_army = {910 + i: {"type": "3tnk", "hp": 100, "x": 82, "y": 82, "t": now} for i in range(7)}  # 8,050 known
     b._enemy_army_seen_at = now
-    b._enemy_buildings = {950: {"id": 950, "type": "tsla", "x": 70, "y": 68}}
+    b._enemy_buildings = {950: {"id": 950, "type": "tsla", "x": 78, "y": 78}}
+    one = [{"id": 900, "type": "3tnk", "x": 66, "y": 66, "hp": 100}]  # one tank in view, 20 cells from their base (80, 80)
     b.choose_action(_state(_base_obs(units=army, visible_enemies=one)), CTX)
     assert "surround" not in b.status()["main_state"]
     assert any("no chasing into their base" in p for p in b.status()["problems"])
+
+
+def test_economy_floor_harvesters_and_refineries_first():
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"vehicle": "3tnk", "build": "dome"}))
+    b.rules = {"harv": {"cost": 1100, "speed": 1.76}, "3tnk": {"cost": 1150, "speed": 1.56}}
+    obs = _base_obs()
+    obs["buildings"] = [b_ for b_ in obs["buildings"] if b_["id"] != 6]       # 1 refinery
+    obs["units"] = [u for u in obs["units"] if u["type"] != "harv"][:0] + [{"id": 50, "type": "harv", "x": 30, "y": 30}]  # 1 harvester
+    orders = _orders(b.choose_action(_state(obs), CTX))
+    assert any(o["cmd"] == "train" and o["item"] == "harv" for o in orders)      # 2 per refinery first
+    assert not any(o["cmd"] == "train" and o["item"] == "3tnk" for o in orders)
+    assert {"cmd": "build", "item": "proc"} in orders                           # the 2nd refinery before the dome
+    obs["buildings"].append({"id": 9, "type": "proc", "x": 32, "y": 20})
+    obs["units"] += [{"id": 60, "type": "harv", "x": 30, "y": 31}, {"id": 61, "type": "harv", "x": 30, "y": 32},
+                     {"id": 62, "type": "harv", "x": 30, "y": 33}]
+    st = _state(obs); st.raw["time"]["game_seconds"] = 400
+    b._sent.clear()
+    orders = _orders(b.choose_action(st, CTX))
+    assert {"cmd": "build", "item": "proc"} in orders                           # the 3rd refinery after 5:00
