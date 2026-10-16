@@ -236,6 +236,9 @@ STRUCTURE_FOCUS_RANGE = 9
 UNIT_ENGAGE_RANGE = 12      # a unit with an enemy unit this close fights units, never buildings
 MAX_MICRO_ORDERS = 6
 CONTACT_RANGE = 10          # the main army is "in contact" with enemies this close to its centre
+GATE_RADIUS = 18            # their force this close to one of our defenses is "at our gate" ...
+TOWER_LINE = 3              # ... and the army fights this far in front of the nearest tower
+TOWER_LEASH = 1.0           # no destination further than a tower's reach + this during a gate fight
 # How much killing an enemy unit is worth (scaled up as its hp drops).
 TARGET_VALUE = {
     "mcv": 6, "v2rl": 5, "arty": 5, "4tnk": 4, "3tnk": 3.5, "ttnk": 3.5, "2tnk": 3, "1tnk": 2.5,
@@ -297,6 +300,8 @@ class RedAlertBot:
         self._blocked: dict[str, float] = {}
         self._rally_set: dict[int, tuple[int, int]] = {}
         self._enemy_buildings: dict[int, dict] = {}  # last known enemy buildings
+        self._our_defenses: list[dict] = []
+        self._gate: dict | None = None  # their force at our gate while we have towers (see _gate_fight)
         self._attacking = False
         self._wave = 0
         self.opening = DEFAULT_OPENING
@@ -602,6 +607,12 @@ class RedAlertBot:
                   f"lost {led['holding'][1]:.0f}")
         if time.monotonic() < self._trade_broken_until:
             group += "; BROKE OFF a losing trade: holding at the edge for a moment"
+        g = self._gate
+        if g is not None:
+            group += (f"; ENEMY AT OUR GATE: {g['n']} of theirs ({g['gate']:.0f}) within {GATE_RADIUS} cells of our "
+                      f"{g['towers']} towers, their whole known army {g['theirs']:.0f} vs our {g['ours']:.0f}: the army "
+                      f"fights under the towers at {list(g['anchor'])} and will not step out; attack/pincer out of "
+                      f"cover is refused until they break or we are {SURROUND_RATIO}x their whole army")
         return (f"our army {ours:.0f} vs their known army {total:.0f} ({ratio}); at our base {self._threat:.0f}; "
                 f"main army: {self._main_state}{held}; ahead of it {getattr(self, '_ahead', 0):.0f}{group}")
 
@@ -712,6 +723,8 @@ class RedAlertBot:
         notes: list[str] = []
         btypes = Counter(str(b.get("type", "")).lower() for b in buildings)
         self._btypes = btypes
+        self._our_defenses = [b for b in buildings if _xy(b) and str(b.get("type", "")).lower() in DEFENSE_TYPES
+                              and self._defense_reach(b) > 0]
         self._our_types = Counter(str(u.get("type", "")).lower() for u in units)
         has_yard = btypes["fact"] > 0
 
@@ -1498,6 +1511,7 @@ class RedAlertBot:
                    base: tuple[int, int] | None, enemy_base: tuple[int, int] | None,
                    staging: tuple[int, int] | None, notes: list[str]) -> list[dict]:
         orders: list[dict] = []
+        self._gate = self._gate_fight(army, enemies, raw)
         if not army:
             self._attacking = False
             return orders
@@ -1756,6 +1770,7 @@ class RedAlertBot:
 
         action = d["main_action"]
         force = [u for u in main if u["id"] not in busy_home]
+        self._gate = self._gate_fight(force, enemies, raw)
         # Trades decide: an attack that is losing value in its last 30 s is
         # broken off, whatever the strength estimate says (fog lies, kills don't).
         if action in ("attack", "pincer", "ambush") and self._attacking:
@@ -1844,14 +1859,14 @@ class RedAlertBot:
         elif action == "hold_edge":
             centre = self._centroid([_xy(u) for u in force])
             if centre and not self._recent("hold", 3.0):
-                spot = self._out_of_reach(centre, raw)
+                spot = self._gate_spot(self._out_of_reach(centre, raw))
                 for chunk in _chunks([u["id"] for u in force if _dist(_xy(u), spot) > 3], max_units):
                     orders.append({"cmd": "attack_move", "units": chunk, "to": list(spot)})
                 self._mark("hold")
         elif action == "hold":
             self._attacking = False
             self._onward = None
-            spot = cell(d["main_x"], d["main_y"], staging)
+            spot = self._gate_spot(cell(d["main_x"], d["main_y"], staging))
             if spot and not self._recent("hold", 3.0):
                 ids = [u["id"] for u in force if _dist(_xy(u), spot) > 4 and (u.get("idle") or not self._recent("hold_all", 10.0))]
                 for chunk in _chunks(ids, max_units):
@@ -1868,6 +1883,7 @@ class RedAlertBot:
         elif action == "defend":
             self._attacking = False
             spot = min((_xy(e) for e in threats), key=lambda c: _dist(c, base)) if threats else (base or staging)
+            spot = self._gate_spot(spot)
             if spot and not self._recent("defend_cmd", 2.0):
                 for chunk in _chunks([u["id"] for u in force], max_units):
                     orders.append({"cmd": "attack_move", "units": chunk, "to": list(spot)})
@@ -1884,6 +1900,69 @@ class RedAlertBot:
                 order = {**order, "units": ids}
             kept.append(order)
         return kept + micro
+
+    def _under_cover(self, cell) -> bool:
+        """Inside the reach (plus TOWER_LEASH) of one of our own defenses."""
+        return any(_dist(cell, _xy(b)) <= self._defense_reach(b) + TOWER_LEASH for b in self._our_defenses)
+
+    def _gate_fight(self, force: list[dict], enemies: list[dict], raw: dict) -> dict | None:
+        """The owner's rule: their force at our gate while we have towers means
+        the army fights UNDER the towers and lets them come. What shows at the
+        gate is the head of their column; the rest is in fog. The army steps
+        out only when it out-matches their WHOLE known army (SURROUND_RATIO),
+        or when what came is siege that must be hunted, not waited for."""
+        defs = self._our_defenses
+        body = [u for u in force if _xy(u)]
+        if not defs or not body:
+            return None
+        foes = [e for e in enemies if _xy(e) and self._is_combat(e)]
+        gate = [e for e in foes if min(_dist(_xy(e), _xy(d)) for d in defs) <= GATE_RADIUS]
+        gate_s = sum(self._strength(e) for e in gate)
+        if gate_s < DOCTRINE_MIN:
+            return None
+        siege_s = sum(self._strength(e) for e in gate if str(e.get("type", "")).lower() in SIEGE_TYPES)
+        if siege_s >= 0.5 * gate_s:
+            return None  # siege outranges the towers: it is hunted, not waited for
+        centre = self._centroid([_xy(u) for u in body])
+        if min(_dist(centre, _xy(d)) for d in defs) > GATE_RADIUS + 6:
+            return None  # the army is away: this is the home guard's fight
+        ours = sum(self._strength(u) for u in body)
+        known, _ = self.enemy_army_estimate()
+        big, _, _ = self.enemy_largest_group()
+        theirs = max(known, big, gate_s)
+        if ours >= SURROUND_RATIO * theirs:
+            return None  # many vs few even counting everything they have shown: the doctrine applies
+        ec = self._centroid([_xy(e) for e in gate])
+        tower = min(defs, key=lambda d: _dist(_xy(d), ec))
+        anchor = self._toward(_xy(tower), ec, TOWER_LINE, raw)
+        return {"anchor": anchor, "tower": tower, "ec": ec, "gate": gate_s, "ours": ours, "theirs": theirs,
+                "n": len(gate), "towers": len(defs)}
+
+    def _gate_spot(self, cell):
+        """``cell``, or the tower line when it lies outside our towers' reach during a gate fight."""
+        g = self._gate
+        if cell is None or g is None or self._under_cover(cell):
+            return cell
+        return g["anchor"]
+
+    def _gate_hold(self, g: dict, force: list[dict], notes: list[str], instead_of: str) -> list[dict]:
+        ids = [u["id"] for u in force if _xy(u) and _dist(_xy(u), g["anchor"]) > 3]
+        orders = [{"cmd": "attack_move", "units": chunk, "to": list(g["anchor"])} for chunk in _chunks(ids, 50)]
+        why = (f"their {g['n']} at our gate (whole known army {g['theirs']:.0f} vs our {g['ours']:.0f}): "
+               f"fighting under our {g['tower'].get('type')} at {list(g['anchor'])} instead of the {instead_of}")
+        self._main_state = why
+        notes.append(why)
+        return orders
+
+    def _gate_refusal(self, target, g: dict) -> None:
+        if self._recent("gate_note", 20.0):
+            return
+        self._mark("gate_note")
+        where = f" to {list(target)}" if target is not None else ""
+        self._problem(f"attack/pincer{where} refused: their force is at our gate ({g['gate']:.0f} in view, "
+                      f"{g['theirs']:.0f} known in all) and we have {g['towers']} towers; the army fights under them at "
+                      f"{list(g['anchor'])}. Order hold/defend there, build tanks and e3, chase when they break")
+        self.log(f"[bot] gate fight: not stepping out{where}; holding under our towers at {list(g['anchor'])}")
 
     def _doctrine(self, raw: dict, force: list[dict], enemies: list[dict], staging, ours_s: float,
                   theirs_s: float, notes: list[str]) -> list[dict] | None:
@@ -1917,7 +1996,21 @@ class RedAlertBot:
                     self._mark("fog_note")
                     self._problem(f"{len(near)} enemy units in view near their base, but their known army + towers is "
                                   f"{theirs_known + defs_s:.0f} vs our {total_ours:.0f}: no chasing into their base")
-        if ratio >= SURROUND_RATIO and cover is not None:
+        g = self._gate
+        if g is not None and not self._under_cover(ec):
+            # The owner's rule: their force is at our gate and we have towers.
+            # What shows is the head of their column; the army holds under the
+            # towers and lets them walk in, whatever the ratio in view says.
+            if self._recent("doctrine", 1.5):
+                return []
+            self._mark("doctrine")
+            ids = [u["id"] for u in body if _dist(_xy(u), g["anchor"]) > 3]
+            orders = [{"cmd": "attack_move", "units": chunk, "to": list(g["anchor"])} for chunk in _chunks(ids, 50)]
+            mode = (f"their {g['n']} at our gate ({ratio:.1f}x in view, their whole known army {g['theirs']:.0f} vs "
+                    f"our {g['ours']:.0f}): holding under our {g['tower'].get('type')} at {list(g['anchor'])}, "
+                    f"letting them walk into it")
+            self._gate_refusal(None, g)  # the commander's attack is not carried out: it is told why
+        elif ratio >= SURROUND_RATIO and cover is not None:
             # Their group sits under a defense: no ring under fire. Hold at the
             # edge of its reach and shoot what comes out; siege deals with the tower.
             if self._recent("doctrine", 1.5):
@@ -1945,6 +2038,9 @@ class RedAlertBot:
                 if _dist(slot, centre) > CHASE_STEP:
                     # No deep chase: step towards the slot, never run off into the fog.
                     slot = self._toward(centre, slot, CHASE_STEP, raw)
+                if g is not None and not self._under_cover(slot):
+                    # At our gate the ring stays inside our towers' reach.
+                    slot = self._toward(_xy(g["tower"]), slot, self._defense_reach(g["tower"]) + TOWER_LEASH, raw)
                 slots.setdefault(slot, []).append(u["id"])
             for slot, ids in slots.items():
                 orders.append({"cmd": "attack_move", "units": ids[:50], "to": list(slot)})
@@ -1956,14 +2052,14 @@ class RedAlertBot:
             coming = [e for e in near if self._approaching(e, centre)]
             ids = [u["id"] for u in body]
             if coming:
-                dest = self._flee_cell(centre, [_xy(e) for e in coming], staging or getattr(self, "_base_cell", None),
-                                       raw, HARASS_STEP)
+                home = _xy(g["tower"]) if g is not None else (staging or getattr(self, "_base_cell", None))
+                dest = self._flee_cell(centre, [_xy(e) for e in coming], home, raw, HARASS_STEP)
                 orders = [{"cmd": "move", "units": chunk, "to": list(dest)} for chunk in _chunks(ids, 50)]
                 mode = f"few vs many ({ratio:.1f}x): backing off while they come on"
             else:
                 # They stopped: shoot from where we stand (micro picks targets);
                 # never walk forward into the bigger force.
-                here = self._out_of_reach(centre, raw)
+                here = self._gate_spot(self._out_of_reach(centre, raw))
                 orders = [{"cmd": "attack_move", "units": chunk, "to": list(here)} for chunk in _chunks(ids, 50)]
                 mode = f"few vs many ({ratio:.1f}x): they stopped, holding ground and shooting what comes"
         else:
@@ -2096,6 +2192,11 @@ class RedAlertBot:
         when the flank is in place (or after PINCER_MAX_WAIT_S) both hit at once."""
         now = time.monotonic()
         alive = {u["id"]: u for u in force if _xy(u)}
+        g = self._gate
+        if g is not None and not self._under_cover(tuple(target)):
+            self._pincer = None
+            self._gate_refusal(tuple(target), g)
+            return self._gate_hold(g, force, notes, f"pincer on {list(target)}")
         p = self._pincer
         explicit = d_main is not None
         if p is not None and p["phase"] != "done":
@@ -2273,6 +2374,16 @@ class RedAlertBot:
         else:
             dest, why = core, f"regrouping en route ({len(near)} of {len(mine)} with the front)"
             self._held_since = None
+        g = self._gate
+        if g is not None and not self._under_cover(dest):
+            # The owner's rule: with their force at our gate and towers at home,
+            # the army fights under the towers; it never steps out to meet them.
+            dest = g["anchor"]
+            why = (f"their {g['n']} at our gate (whole known army {g['theirs']:.0f} vs our {g['ours']:.0f}): "
+                   f"fighting under our {g['tower'].get('type')} at {list(dest)}, not stepping out to {list(target)}")
+            self._held_since = None
+            if obey:
+                self._gate_refusal(target, g)
         for chunk in _chunks(core_ids, max_units):
             orders.append({"cmd": "attack_move", "units": chunk, "to": list(dest)})
         notes.append(why)

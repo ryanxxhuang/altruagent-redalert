@@ -1378,3 +1378,65 @@ def test_scouting_stops_after_two_dead_scouts():
     assert b._scouting_stopped_until > 0 and any("scout killed" in p for p in b.status()["problems"])
     b._sent.clear(); b.choose_action(_state(_base_obs(units=[{"id": 300, "type": "e1", "x": 26, "y": 26, "idle": True, "hp": 100}])), CTX)
     assert not b._raiders  # no third rifleman sent
+
+
+def _gate_scene(visible_at_gate, commander):
+    """Our base at (20,20) with a flame tower at (30,24) and eight heavy tanks in front of it."""
+    tower = {"id": 7, "type": "ftur", "x": 30, "y": 24}
+    army = [{"id": 100 + i, "type": "3tnk", "x": 29 + (i % 4), "y": 26 + (i // 4), "idle": True, "hp": 100} for i in range(8)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander(commander))
+    b.rules = {"3tnk": {"cost": 1150, "speed": 1.56}, "2tnk": {"cost": 850, "speed": 1.76}, "ftur": {"cost": 600}}
+    obs = _base_obs(units=army, visible_enemies=visible_at_gate)
+    obs["buildings"].append(tower)
+    return b, obs, {u["id"] for u in army}
+
+
+def _their_column_seen(b, obs):
+    # Tick 1: their whole column (12 medium tanks) is seen far out; the next tick only its head is at our gate.
+    far = [{"id": 900 + i, "type": "2tnk", "x": 60 + (i % 4), "y": 40 + (i // 4), "hp": 100} for i in range(12)]
+    b.choose_action(_state(dict(obs, visible_enemies=far)), CTX)
+    b._sent.clear()
+
+
+def _head_at_gate():
+    return [{"id": 950 + i, "type": "2tnk", "x": 40, "y": 29 + i, "hp": 100} for i in range(4)]
+
+
+def test_their_force_at_our_gate_is_fought_under_the_towers():
+    # 2.7x in view at the gate, but their whole known army (16 tanks) out-matches ours: no stepping out.
+    b, obs, ids = _gate_scene(_head_at_gate(), {"main_action": "attack", "main_x": 60, "main_y": 60})
+    _their_column_seen(b, obs)
+    orders = _orders(b.choose_action(_state(obs), CTX))
+    assert b._gate is not None
+    assert "at our gate" in b.status()["main_state"] and "surround" not in b.status()["main_state"]
+    moves = [o for o in orders if o["cmd"] in ("attack_move", "move") and set(o["units"]) & ids]
+    assert moves and all(b._under_cover(tuple(o["to"])) for o in moves)
+    assert any("refused" in p and "gate" in p for p in b.status()["problems"])
+    assert "ENEMY AT OUR GATE" in b._situation()
+
+
+def test_many_vs_few_at_the_gate_still_sorties():
+    # Nothing else of theirs was ever seen: 9,200 vs 3,400 in all is a real many-vs-few, the doctrine applies.
+    b, obs, ids = _gate_scene(_head_at_gate(), {"main_action": "attack", "main_x": 60, "main_y": 60})
+    b.choose_action(_state(obs), CTX)
+    assert b._gate is None
+    assert "surround" in b.status()["main_state"]
+
+
+def test_pincer_out_of_cover_is_refused_at_the_gate():
+    b, obs, ids = _gate_scene(_head_at_gate(), {"main_action": "pincer", "main_x": 42, "main_y": 31})
+    _their_column_seen(b, obs)
+    assert b._pincer is not None  # planned while their column was far away
+    orders = _orders(b.choose_action(_state(obs), CTX))
+    assert b._pincer is None
+    assert any("refused" in p and "gate" in p for p in b.status()["problems"])
+    moves = [o for o in orders if o["cmd"] in ("attack_move", "move") and set(o["units"]) & ids]
+    assert moves and all(b._under_cover(tuple(o["to"])) for o in moves)
+
+
+def test_hold_outside_cover_is_pulled_under_the_towers_at_the_gate():
+    b, obs, ids = _gate_scene(_head_at_gate(), {"main_action": "hold", "main_x": 44, "main_y": 32})
+    _their_column_seen(b, obs)
+    orders = _orders(b.choose_action(_state(obs), CTX))
+    moves = [o for o in orders if o["cmd"] == "attack_move" and set(o["units"]) & ids]
+    assert moves and all(b._under_cover(tuple(o["to"])) for o in moves)
