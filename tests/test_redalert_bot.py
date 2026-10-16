@@ -1704,3 +1704,17 @@ def test_home_guard_backs_off_from_a_much_stronger_force_instead_of_standing():
     back = [o for o in orders if o["cmd"] == "move" and set(o["units"]) & {100, 101, 102}]
     assert back and all(o["to"][0] < 34 for o in back)  # away from them, towards the gun
     assert orders[-1]["cmd"] == "move"  # the back-off is the last word, after micro's focus fire
+
+
+def test_an_idle_ambush_at_huge_odds_is_reported():
+    from agent import redalert_bot as rb
+    army = [{"id": 100 + i, "type": "2tnk", "x": 30, "y": 30, "idle": True, "hp": 100} for i in range(8)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "hold", "main_x": 30, "main_y": 30}))
+    b.rules = {"2tnk": {"cost": 850, "speed": 1.76}, "e1": {"cost": 100, "speed": 1.32}}
+    foe = [{"id": 900, "type": "e1", "x": 45, "y": 45, "hp": 100}]
+    st = _state(_base_obs(units=army, visible_enemies=foe)); st.raw["time"]["game_seconds"] = 300
+    b.choose_action(st, CTX)
+    st2 = _state(_base_obs(units=army, visible_enemies=foe)); st2.raw["time"]["game_seconds"] = 300 + rb.IDLE_NOTE_S + 1
+    b._sent.clear()
+    b.choose_action(st2, CTX)
+    assert any("IDLE ARMY" in p for p in b.status()["problems"])

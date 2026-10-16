@@ -181,6 +181,7 @@ RAID_TARGET_VALUE = {"harv": 10.0, "mcv": 8.0, "arty": 6.0, "v2rl": 6.0, "e1": 1
                      "medi": 2.0, "jeep": 1.0, "ftrk": 0.8, "apc": 0.6}
 RAID_DANGER_RANGE = 14      # enemies this close to a route point count as danger on it
 HOME_IDLE_MAX_S = 40.0      # an army waiting at home longer than this attacks if not weaker
+IDLE_NOTE_S = 60.0          # a hold/ambush this long at 3x+ their army is reported as an idle army (advisory)
 # The field commander (an LLM) decides production and army moves; its last
 # decision counts for this long. Silent longer, the bot's own rules take over.
 LLM_STALE_S = 20.0
@@ -1888,9 +1889,20 @@ class RedAlertBot:
                 action = "hold_edge"
         # How long the army has been held at home: reported to the commander
         # (the playbook says not to idle); the decision stays the LLM's.
-        if action == "hold" and not threats and len(force) >= 6:
+        if action in ("hold", "ambush") and not threats and len(force) >= 6:
             if self._holding_since is None:
                 self._holding_since = self._game_s
+            idle = self._game_s - self._holding_since
+            known_s, _ = self.enemy_army_estimate()
+            ours_all = sum(self._strength(u) for u in force)
+            if idle >= IDLE_NOTE_S and ours_all >= 3 * max(known_s, 1.0) and not self._recent("idle_note", IDLE_NOTE_S):
+                self._mark("idle_note")
+                big, big_cell, _ = self.enemy_largest_group()
+                self._problem(f"IDLE ARMY: {idle:.0f}s in {action} at {ours_all / max(known_s, 1.0):.0f}x their known army. An idle "
+                              f"army earns nothing while they mine: finish what is in the open"
+                              + (f" (their {big:.0f} at {list(big_cell)})" if big_cell else "")
+                              + ", siege their outer buildings from outside tower range, raid their harvesters; stay out of an "
+                              "unseen base. Ambush only a group worth the trap (1,000+)")
         else:
             self._holding_since = None
         if action in ("retreat", "defend") or (action == "attack" and self._pincer and _dist(self._pincer["target"], cell(d["main_x"], d["main_y"], self._pincer["target"])) > PINCER_RETARGET):
