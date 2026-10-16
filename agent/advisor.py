@@ -354,6 +354,7 @@ class Commanders:
                 {"situation": (bot_status or {}).get("situation"),
                  "opponent": (bot_status or {}).get("opponent"),
                  "ledger": (bot_status or {}).get("ledger"),
+                 "raid_candidates": (bot_status or {}).get("raid_candidates"),
                  "your_recent_decisions": [
                      {k: v for k, v in dd.items() if k in ("main_action", "main_x", "main_y", "raid_size", "build", "vehicle")}
                      for dd in list(self._recent_decisions)[-3:]],

@@ -1290,3 +1290,25 @@ def test_under_llm_authority_the_guards_only_advise(monkeypatch):
     orders = _orders(b2.choose_action(_state(obs), CTX))
     assert {"cmd": "build", "item": "dome"} in orders and any(o["cmd"] == "train" and o["item"] == "harv" for o in orders)
     assert any("build tanks" in a for a in b2.opponent_model()["advice"])
+
+
+def test_raid_striking_empty_ground_twice_goes_home_and_lists_candidates():
+    import time as _t
+    from agent import redalert_bot as rb
+    squad = [{"id": 100 + i, "type": "jeep", "x": 72, "y": 72, "idle": True, "hp": 100} for i in range(3)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 3, "raid_x": 74, "raid_y": 73}))
+    b.rules = {"jeep": {"cost": 500, "speed": 4.0}}
+    b.choose_action(_state(_base_obs(units=squad)), CTX)
+    assert b._raid_phase == "strike"
+    b._raid_phase_since -= rb.RAID_EMPTY_STRIKE_S + 0.1
+    b._sent.clear(); b.choose_action(_state(_base_obs(units=squad)), CTX)
+    assert b._raid_phase == "withdraw" and b._raid_empty_streak == 1
+    assert b._raid_hot_now((74, 73))  # that patch is skipped for a while
+    # Second empty strike (another spot): the squad goes home and the commander is told.
+    b._raid_phase, b._raid_phase_since = "strike", _t.monotonic() - rb.RAID_EMPTY_STRIKE_S - 0.1
+    b._raid_hp_start = 300
+    b.advisor = FakeCommander({"raid_size": 3, "raid_x": 90, "raid_y": 90})
+    b._sent.clear(); b.choose_action(_state(_base_obs(units=[{**u, "x": 88, "y": 88} for u in squad])), CTX)
+    assert b._raid_home_until > _t.monotonic() and any("found nothing twice" in p for p in b.status()["problems"])
+    cands = b.status()["raid_candidates"]
+    assert isinstance(cands, list)

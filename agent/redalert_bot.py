@@ -104,6 +104,9 @@ RAID_PREY_RANGE = 14        # a harvester this close to the squad is attacked at
 RAID_ARMY_AVOID = 16        # raids keep this far from any enemy combat unit seen within RAID_ARMY_MEMORY_S
 RAID_ARMY_MEMORY_S = 120.0
 RAID_HOT_S = 120.0          # a target the squad was driven off is avoided this long
+RAID_EMPTY_S = 60.0         # a target where the squad found nothing is skipped this long
+RAID_EMPTY_STRIKE_S = 1.5   # a strike with nothing in reach ends this fast
+RAID_HOME_S = 45.0          # two empty strikes in a row: the squad waits at home this long
 RAID_HOT_CELL = 10          # ... as a block this many cells across
 RAID_BUILDING_PRIORITY = {"powr": 0, "apwr": 0, "proc": 1, "silo": 2, "weap": 3, "barr": 3, "tent": 3, "dome": 4,
                           "fix": 4, "stek": 5, "atek": 5}
@@ -300,6 +303,9 @@ class RedAlertBot:
         self._raid_hp_start = 0.0                # squad hp when the strike began
         self._raid_last_chased = 0.0             # when an enemy last came closer to the squad
         self._raid_hot: dict[tuple[int, int], list[float]] = {}  # target -> times the squad was driven off there
+        self._raid_empty: dict[tuple[int, int], float] = {}    # target -> when the squad found nothing there
+        self._raid_empty_streak = 0
+        self._raid_home_until = 0.0
         self._raid_built = 0                      # raid vehicles the bot has queued itself
         self._raid_losses: list[float] = []       # when a raider died on a raid
         self._raid_paused_until = 0.0
@@ -433,6 +439,7 @@ class RedAlertBot:
             "enemy_ore_field": list(self._enemy_ore) if self._enemy_ore else None,
             "raid_squad": len(self._raiders),
             "raid": self._raid_info,
+            "raid_candidates": self.raid_candidates(getattr(self, "_enemy_base_cache", None)),
             "apc_raid": getattr(self, "_apc_info", None) if self._apc else None,
             "main_idle_seconds": round(self._game_s - self._holding_since) if self._holding_since is not None else 0,
             "idle_combat_units": getattr(self, "_idle_combat", 0),
@@ -1604,6 +1611,8 @@ class RedAlertBot:
                 self.log(f"[bot] raids paused: {len(self._raid_losses)} raiders lost recently")
         self._raiders &= set(alive)
         rtarget = cell(d["raid_x"], d["raid_y"], None)
+        if rtarget:
+            self._raid_home_until = 0.0  # the commander chose a target: go
         if rtarget and self._covered_by_defense(rtarget):
             b = self._covered_by_defense(rtarget)
             self._problem(f"raid target {list(rtarget)} is inside the reach of their {b.get('type')} at "
@@ -2351,8 +2360,23 @@ class RedAlertBot:
             hurt = self._raid_hp_start > 0 and hp < self._raid_hp_start * (1 - RAID_HURT_SHARE)
             # Many vs few: nobody defending and prey in reach -> finish it off.
             prey = any(_xy(e) and _dist(_xy(e), centre) <= RAID_PREY_RANGE and not self._is_combat(e) for e in enemies)
+            bld = any(_xy(b) and _dist(_xy(b), centre) <= 10 and str(b.get("type", "")).lower() not in DEFENSE_TYPES
+                      for b in getattr(self, "_visible_enemy_buildings", []))
             unopposed = responders == 0 and prey and now < self._raid_strike_until - RAID_STRIKE_S + RAID_STRIKE_MAX_S
-            if threatened or hurt or (now >= self._raid_strike_until and not unopposed):
+            nothing_here = not prey and not bld and now >= self._raid_phase_since + RAID_EMPTY_STRIKE_S
+            if threatened or hurt or nothing_here or (now >= self._raid_strike_until and not unopposed):
+                if nothing_here and target:
+                    key = (int(target[0]) // RAID_HOT_CELL, int(target[1]) // RAID_HOT_CELL)
+                    self._raid_empty[key] = now
+                    self._raid_empty_streak += 1
+                    if self._raid_empty_streak >= 2:
+                        self._raid_home_until = now + RAID_HOME_S
+                        self._raid_empty_streak = 0
+                        self._problem(f"raid found nothing twice (last at {list(target)}): their harvesters are elsewhere; "
+                                      f"squad waits at home {RAID_HOME_S:.0f}s. Scout, or give raid_x/raid_y")
+                        self.log("[bot] raid: nothing to hit twice, going home for a while")
+                elif prey or bld:
+                    self._raid_empty_streak = 0
                 phase = "withdraw"
         if phase == "withdraw" and self._raid_phase != "withdraw" and target:
             key = (int(target[0]) // RAID_HOT_CELL, int(target[1]) // RAID_HOT_CELL)
@@ -2390,13 +2414,20 @@ class RedAlertBot:
                   controlled: set[int]) -> list[dict]:
         """The squad's orders for its current phase (see _raid_phase_update)."""
         view = self._raid_view(alive, enemies)
-        if view is None or not target:
+        if view is None:
             return []
         squad, centre, combat_foes, near_foes, responders, squad_s = view
-        phase = self._raid_phase
         ids = [i for i in sorted(self._raiders) if i not in controlled]
         if not ids:
             return []
+        if not target:
+            # Nothing to raid right now: wait at home, out of harm's way.
+            if staging and _dist(centre, staging) > 6 and not self._recent("raid_withdraw", 3.0):
+                self._mark("raid_withdraw")
+                self._raid_info = {"size": len(squad), "phase": "home", "at": list(centre), "target": None, "responders": 0}
+                return [{"cmd": "move", "units": ids, "to": list(staging)}]
+            return []
+        phase = self._raid_phase
         orders: list[dict] = []
         if phase == "approach":
             if not self._recent("raid", 4.0):
@@ -2599,6 +2630,38 @@ class RedAlertBot:
                    if now - e["t"] <= RAID_ARMY_MEMORY_S and _dist((e["x"], e["y"]), cell) <= radius)
         return near >= DOCTRINE_MIN
 
+    def raid_candidates(self, enemy_base) -> list[dict]:
+        """Raid targets with their status, for the commander to choose from."""
+        out = []
+        now = time.monotonic()
+        patches: list[tuple[int, int]] = []
+        for c in _ore_cells_near(self._config, enemy_base) if enemy_base else []:
+            if not any(_dist(c, p) <= 8 for p in patches):
+                patches.append(c)
+        for c in patches[:4]:
+            cov = self._covered_by_defense(c)
+            key = (int(c[0]) // RAID_HOT_CELL, int(c[1]) // RAID_HOT_CELL)
+            status = ("covered by " + str(cov.get("type")) if cov else
+                      "guarded (driven off)" if any(now - t < RAID_HOT_S for t in self._raid_hot.get(key, [])) else
+                      "their army near" if self._near_their_army(c) else
+                      f"empty {now - self._raid_empty[key]:.0f}s ago" if now - self._raid_empty.get(key, -1e9) < RAID_EMPTY_S else
+                      "open")
+            out.append({"ore": list(c), "status": status})
+        harv = [(c, t) for c, t in self._enemy_harv_seen.values() if now - t < 90]
+        for c, t in harv[-3:]:
+            out.append({"harvester_seen": list(c), "seconds_ago": round(now - t)})
+        for b in list(self._enemy_buildings.values())[:30]:
+            t = str(b.get("type", "")).lower()
+            c = _xy(b)
+            if not c or t in DEFENSE_TYPES or t == "fact":
+                continue
+            if self._covered_by_defense(c) or self._near_their_army(c):
+                continue
+            out.append({"building": t, "at": list(c), "status": "undefended"})
+            if len(out) >= 10:
+                break
+        return out
+
     def _raid_building_target(self) -> tuple[int, int] | None:
         """An undefended enemy building away from their army: power first."""
         big, big_cell, age = self.enemy_largest_group()
@@ -2620,6 +2683,8 @@ class RedAlertBot:
     def _raid_hot_now(self, cell) -> bool:
         key = (int(cell[0]) // RAID_HOT_CELL, int(cell[1]) // RAID_HOT_CELL)
         now = time.monotonic()
+        if now - self._raid_empty.get(key, -1e9) < RAID_EMPTY_S:
+            return True  # found nothing there a moment ago
         return any(now - t < RAID_HOT_S for t in self._raid_hot.get(key, []))
 
     def _raid_cell(self, enemy_base) -> tuple[int, int] | None:
@@ -2631,6 +2696,8 @@ class RedAlertBot:
         if self._ambush and self._ambush["phase"] in ("set", "baiting"):
             return self._ambush["bait"]
         now = time.monotonic()
+        if now < self._raid_home_until:
+            return None  # waiting at home after striking empty ground twice
         ok = lambda c: not self._covered_by_defense(c) and not self._raid_hot_now(c) and not self._near_their_army(c)  # noqa: E731
         recent = [c for c, t in self._enemy_harv_seen.values() if now - t < 45 and ok(c)]
         if recent:
