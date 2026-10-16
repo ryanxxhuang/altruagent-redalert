@@ -101,7 +101,10 @@ RAID_WITHDRAW_RATIO = 0.35  # withdraw when responders reach this share of the s
 RAID_HURT_SHARE = 0.05      # ... or when the squad has lost this share of its hp since the strike began
 RAID_BUILD_CAP = 4          # raid vehicles the bot replaces per match on its own
 RAID_PREY_RANGE = 14        # a harvester this close to the squad is attacked at once, whatever else is around
-RAID_ARMY_AVOID = 16        # raids keep this far from their main army's last known position (seen within 40 s)
+RAID_ARMY_AVOID = 16        # raids keep this far from any enemy combat unit seen within RAID_ARMY_MEMORY_S
+RAID_ARMY_MEMORY_S = 120.0
+RAID_HOT_S = 120.0          # a target the squad was driven off is avoided this long
+RAID_HOT_CELL = 10          # ... as a block this many cells across
 RAID_BUILDING_PRIORITY = {"powr": 0, "apwr": 0, "proc": 1, "silo": 2, "weap": 3, "barr": 3, "tent": 3, "dome": 4,
                           "fix": 4, "stek": 5, "atek": 5}
 # Ambush: the raid baits their army into a pocket between our two groups.
@@ -907,7 +910,8 @@ class RedAlertBot:
         handled: set[str] = set()
         # The commander's raid squad needs fast vehicles: build them first.
         apc_mode = bool(d) and str(d.get("raid_unit") or "").lower() == "apc"
-        if d and d.get("raid_size", 0) >= (1 if apc_mode else 2) and "Vehicle" not in busy and not self._recent("vehicle", 0.8):
+        eco_ok = len(harvesters) + queued["harv"] >= min(2 * max(have["proc"], 1), 3)
+        if d and eco_ok and d.get("raid_size", 0) >= (1 if apc_mode else 2) and "Vehicle" not in busy and not self._recent("vehicle", 0.8):
             if apc_mode:
                 fast_owned = sum(1 for u in army if str(u.get("type", "")).lower() == "apc") + queued["apc"]
             else:
@@ -1811,6 +1815,13 @@ class RedAlertBot:
             centre = self._centroid([_xy(u) for u in alive.values()])
             if not centre:
                 return []
+            ours_total = sum(self._strength(u) for u in alive.values())
+            if big >= DOCTRINE_MIN and age <= 60 and ours_total < AHEAD_EDGE * big or len(alive) < 6:
+                self._problem(f"ambush refused: our {ours_total:.0f} vs their group {big:.0f} (need 1.3x and 6+ units); "
+                              f"splitting a weaker army loses it. Defend, raid, build tanks")
+                self._main_state = "ambush refused: too weak to split"
+                notes.append(self._main_state)
+                return []
             their = big_cell or getattr(self, "_enemy_base_cache", None)
             if not their:
                 self._problem("ambush: no enemy group or base known to bait; scout first")
@@ -2232,13 +2243,12 @@ class RedAlertBot:
             if threatened or hurt or (now >= self._raid_strike_until and not unopposed):
                 phase = "withdraw"
         if phase == "withdraw" and self._raid_phase != "withdraw" and target:
-            key = (int(target[0]) // 6, int(target[1]) // 6)
-            hits = [t for t in self._raid_hot.get(key, []) if now - t < 90]
+            key = (int(target[0]) // RAID_HOT_CELL, int(target[1]) // RAID_HOT_CELL)
+            hits = [t for t in self._raid_hot.get(key, []) if now - t < RAID_HOT_S]
             hits.append(now)
             self._raid_hot[key] = hits
-            if len(hits) >= 2:
-                self._problem(f"raids at {list(target)} keep getting driven off ({len(hits)}x): that ore is guarded; "
-                              f"raiding elsewhere for 90 s (give raid_x/raid_y to choose)")
+            self._problem(f"raid at {list(target)} was driven off: that spot is guarded; "
+                          f"raiding elsewhere for {RAID_HOT_S:.0f} s (give raid_x/raid_y to choose)")
         if phase == "withdraw":
             # Run for at least RAID_NOT_CHASED_S, then stop once nobody chases.
             started = self._raid_phase_since if self._raid_phase == "withdraw" else now
@@ -2474,7 +2484,7 @@ class RedAlertBot:
         field counts as much as the main army for a raid squad."""
         now = time.monotonic()
         near = sum(self._strength(e) for e in self._enemy_army.values()
-                   if now - e["t"] <= 40 and _dist((e["x"], e["y"]), cell) <= radius)
+                   if now - e["t"] <= RAID_ARMY_MEMORY_S and _dist((e["x"], e["y"]), cell) <= radius)
         return near >= DOCTRINE_MIN
 
     def _raid_building_target(self) -> tuple[int, int] | None:
@@ -2496,9 +2506,9 @@ class RedAlertBot:
         return options[0][2]
 
     def _raid_hot_now(self, cell) -> bool:
-        key = (int(cell[0]) // 6, int(cell[1]) // 6)
+        key = (int(cell[0]) // RAID_HOT_CELL, int(cell[1]) // RAID_HOT_CELL)
         now = time.monotonic()
-        return sum(1 for t in self._raid_hot.get(key, []) if now - t < 90) >= 2
+        return any(now - t < RAID_HOT_S for t in self._raid_hot.get(key, []))
 
     def _raid_cell(self, enemy_base) -> tuple[int, int] | None:
         """The ambush bait point while an ambush is set; else where enemy

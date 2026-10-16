@@ -824,6 +824,7 @@ def test_raid_squad_takes_moving_units_not_only_idle_ones():
 
 def test_raids_never_use_infantry_and_jeeps_get_built():
     units = [{"id": 100 + i, "type": "e3", "x": 40, "y": 40, "idle": True, "hp": 100} for i in range(6)]
+    units += [{"id": 50 + i, "type": "harv", "x": 30, "y": 30} for i in range(1, 3)]  # 3 harvesters: economy is fine
     b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 2, "raid_unit": "jeep", "vehicle": "3tnk"}))
     b.rules = {"jeep": {"cost": 500, "speed": 4.0}, "e3": {"cost": 300, "speed": 1.32}, "3tnk": {"cost": 1150, "speed": 1.56}}
     obs = _base_obs(units=units)
@@ -1060,7 +1061,7 @@ def test_pincer_does_not_restart_when_the_auto_target_drifts():
 def test_raid_avoids_a_target_it_keeps_getting_driven_off():
     import time as _t
     b = bot()
-    b._raid_hot = {(74 // 6, 73 // 6): [_t.monotonic(), _t.monotonic()]}
+    b._raid_hot = {(74 // 10, 73 // 10): [_t.monotonic()]}
     b._config = {"rules": {"maps": {"m": {"spawns": [[80, 80]], "layout": {
         "origin": [0, 0], "rows": ["." * 100] * 72 + ["." * 72 + "$$$$" + "." * 24] * 3 + ["." * 100] * 25}}}}}
     assert b._raid_cell((80, 80)) is None  # the only patch is hot: no raid there for now
@@ -1204,3 +1205,32 @@ def test_repeated_failed_attacks_cool_off_longer_each_time():
     for _ in range(6):
         b._break_off("test")
     assert b._trade_broken_until - __import__("time").monotonic() <= rb.TRADE_COOLDOWN_MAX_S + 1
+
+
+def test_ambush_is_refused_when_we_are_weaker():
+    import time as _t
+    army = [{"id": 100 + i, "type": "3tnk", "x": 40, "y": 50, "idle": True, "hp": 100} for i in range(6)]  # 6,900
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "ambush"}))
+    b.rules = {"3tnk": {"cost": 1150, "speed": 1.56}, "2tnk": {"cost": 850, "speed": 1.76}}
+    b._enemy_army = {900 + i: {"type": "2tnk", "hp": 100, "x": 80, "y": 50, "t": _t.monotonic()} for i in range(8)}  # 6,800
+    b._enemy_army_seen_at = _t.monotonic()
+    b.choose_action(_state(_base_obs(units=army)), CTX)
+    assert b._ambush is None and any("ambush refused" in p for p in b.status()["problems"])
+
+
+def test_raid_vehicles_wait_for_the_economy():
+    units = [{"id": 100 + i, "type": "e3", "x": 40, "y": 40, "idle": True, "hp": 100} for i in range(4)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 2, "raid_unit": "ftrk", "vehicle": "harv"}))
+    b.rules = {"ftrk": {"cost": 600, "speed": 2.76}, "harv": {"cost": 1100, "speed": 1.76}, "e3": {"cost": 300, "speed": 1.32}}
+    obs = _base_obs(units=units)  # 1 harvester, 1 refinery
+    obs["available_production"] = obs["available_production"] + ["ftrk"]
+    orders = _orders(b.choose_action(_state(obs), CTX))
+    assert not any(o["cmd"] == "train" and o["item"] == "ftrk" for o in orders)  # harvesters first
+    assert any(o["cmd"] == "train" and o["item"] == "harv" for o in orders)
+
+
+def test_one_driven_off_raid_marks_the_spot_hot():
+    import time as _t
+    b = bot()
+    b._raid_hot = {(74 // 10, 73 // 10): [_t.monotonic()]}
+    assert b._raid_hot_now((74, 73)) and b._raid_hot_now((70, 70))
