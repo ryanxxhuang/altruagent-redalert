@@ -1380,6 +1380,7 @@ def test_scouting_stops_after_two_dead_scouts():
     assert not b._raiders  # no third rifleman sent
 
 
+
 def _gate_scene(visible_at_gate, commander):
     """Our base at (20,20) with a flame tower at (30,24) and eight heavy tanks in front of it."""
     tower = {"id": 7, "type": "ftur", "x": 30, "y": 24}
@@ -1402,17 +1403,34 @@ def _head_at_gate():
     return [{"id": 950 + i, "type": "2tnk", "x": 40, "y": 29 + i, "hp": 100} for i in range(4)]
 
 
-def test_their_force_at_our_gate_is_fought_under_the_towers():
-    # 2.7x in view at the gate, but their whole known army (16 tanks) out-matches ours: no stepping out.
+def _army_moves(orders, ids):
+    return [o for o in orders if o["cmd"] in ("attack_move", "move") and set(o["units"]) & ids]
+
+
+def test_gate_fight_warns_but_the_commanders_attack_stands():
+    # 2.7x in view at the gate, but their whole known army (16 tanks) out-matches ours. The commander's
+    # order is the highest principle: the attack goes out of cover, with a WARNING and the facts.
     b, obs, ids = _gate_scene(_head_at_gate(), {"main_action": "attack", "main_x": 60, "main_y": 60})
     _their_column_seen(b, obs)
     orders = _orders(b.choose_action(_state(obs), CTX))
-    assert b._gate is not None
+    assert b._gate is not None and not b._gate["strict"]
+    moves = _army_moves(orders, ids)
+    assert moves and any(not b._under_cover(tuple(o["to"])) for o in moves)
+    assert any("WARNING" in p and "OUT of our towers" in p for p in b.status()["problems"])
+    assert "ENEMY AT OUR GATE" in b._situation() and "your orders stand" in b._situation()
+
+
+def test_gate_fight_refuses_to_step_out_in_rules_mode(monkeypatch):
+    monkeypatch.setattr(__import__('agent.redalert_bot', fromlist=['x']), 'LLM_AUTHORITY', False)
+    b, obs, ids = _gate_scene(_head_at_gate(), {"main_action": "attack", "main_x": 60, "main_y": 60})
+    _their_column_seen(b, obs)
+    orders = _orders(b.choose_action(_state(obs), CTX))
+    assert b._gate is not None and b._gate["strict"]
     assert "at our gate" in b.status()["main_state"] and "surround" not in b.status()["main_state"]
-    moves = [o for o in orders if o["cmd"] in ("attack_move", "move") and set(o["units"]) & ids]
+    moves = _army_moves(orders, ids)
     assert moves and all(b._under_cover(tuple(o["to"])) for o in moves)
     assert any("refused" in p and "gate" in p for p in b.status()["problems"])
-    assert "ENEMY AT OUR GATE" in b._situation()
+    assert "orders out of cover are refused" in b._situation()
 
 
 def test_many_vs_few_at_the_gate_still_sorties():
@@ -1423,20 +1441,33 @@ def test_many_vs_few_at_the_gate_still_sorties():
     assert "surround" in b.status()["main_state"]
 
 
-def test_pincer_out_of_cover_is_refused_at_the_gate():
+def test_pincer_out_of_cover_is_warned_about_but_stands(monkeypatch):
     b, obs, ids = _gate_scene(_head_at_gate(), {"main_action": "pincer", "main_x": 42, "main_y": 31})
     _their_column_seen(b, obs)
     assert b._pincer is not None  # planned while their column was far away
-    orders = _orders(b.choose_action(_state(obs), CTX))
-    assert b._pincer is None
-    assert any("refused" in p and "gate" in p for p in b.status()["problems"])
-    moves = [o for o in orders if o["cmd"] in ("attack_move", "move") and set(o["units"]) & ids]
-    assert moves and all(b._under_cover(tuple(o["to"])) for o in moves)
+    b.choose_action(_state(obs), CTX)
+    assert b._pincer is not None  # ... and carried on at the gate: the commander's call
+    assert any("WARNING" in p and "[42, 31]" in p for p in b.status()["problems"])
+    # Rules mode: the same pincer is refused and the army holds under the tower.
+    monkeypatch.setattr(__import__('agent.redalert_bot', fromlist=['x']), 'LLM_AUTHORITY', False)
+    b2, obs2, ids2 = _gate_scene(_head_at_gate(), {"main_action": "pincer", "main_x": 42, "main_y": 31})
+    _their_column_seen(b2, obs2)
+    orders = _orders(b2.choose_action(_state(obs2), CTX))
+    assert b2._pincer is None
+    assert any("refused" in p and "gate" in p for p in b2.status()["problems"])
+    moves = _army_moves(orders, ids2)
+    assert moves and all(b2._under_cover(tuple(o["to"])) for o in moves)
 
 
-def test_hold_outside_cover_is_pulled_under_the_towers_at_the_gate():
+def test_commanded_hold_cell_stands_at_the_gate_but_the_default_stays_under_the_towers(monkeypatch):
     b, obs, ids = _gate_scene(_head_at_gate(), {"main_action": "hold", "main_x": 44, "main_y": 32})
     _their_column_seen(b, obs)
     orders = _orders(b.choose_action(_state(obs), CTX))
-    moves = [o for o in orders if o["cmd"] == "attack_move" and set(o["units"]) & ids]
-    assert moves and all(b._under_cover(tuple(o["to"])) for o in moves)
+    moves = _army_moves(orders, ids)
+    assert moves and all(o["to"] == [44, 32] for o in moves)  # the commander chose the cell: it stands
+    monkeypatch.setattr(__import__('agent.redalert_bot', fromlist=['x']), 'LLM_AUTHORITY', False)
+    b2, obs2, ids2 = _gate_scene(_head_at_gate(), {"main_action": "hold", "main_x": 44, "main_y": 32})
+    _their_column_seen(b2, obs2)
+    orders = _orders(b2.choose_action(_state(obs2), CTX))
+    moves = _army_moves(orders, ids2)
+    assert moves and all(b2._under_cover(tuple(o["to"])) for o in moves)  # rules mode: pulled under the tower

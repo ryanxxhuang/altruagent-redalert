@@ -610,9 +610,11 @@ class RedAlertBot:
         g = self._gate
         if g is not None:
             group += (f"; ENEMY AT OUR GATE: {g['n']} of theirs ({g['gate']:.0f}) within {GATE_RADIUS} cells of our "
-                      f"{g['towers']} towers, their whole known army {g['theirs']:.0f} vs our {g['ours']:.0f}: the army "
-                      f"fights under the towers at {list(g['anchor'])} and will not step out; attack/pincer out of "
-                      f"cover is refused until they break or we are {SURROUND_RATIO}x their whole army")
+                      f"{g['towers']} towers; their WHOLE known army {g['theirs']:.0f} vs our {g['ours']:.0f}; the owner's "
+                      f"rule: fight under the towers at {list(g['anchor'])}, step out only at {SURROUND_RATIO}x their whole "
+                      f"army; the main army is {'OUTSIDE tower cover' if g['army_out'] else 'under the towers'}"
+                      + ("; your orders stand, one out of cover gets a WARNING in problems" if not g["strict"]
+                         else "; orders out of cover are refused"))
         return (f"our army {ours:.0f} vs their known army {total:.0f} ({ratio}); at our base {self._threat:.0f}; "
                 f"main army: {self._main_state}{held}; ahead of it {getattr(self, '_ahead', 0):.0f}{group}")
 
@@ -1511,7 +1513,7 @@ class RedAlertBot:
                    base: tuple[int, int] | None, enemy_base: tuple[int, int] | None,
                    staging: tuple[int, int] | None, notes: list[str]) -> list[dict]:
         orders: list[dict] = []
-        self._gate = self._gate_fight(army, enemies, raw)
+        self._gate = self._gate_fight(army, enemies, raw, commanded=False)
         if not army:
             self._attacking = False
             return orders
@@ -1770,7 +1772,7 @@ class RedAlertBot:
 
         action = d["main_action"]
         force = [u for u in main if u["id"] not in busy_home]
-        self._gate = self._gate_fight(force, enemies, raw)
+        self._gate = self._gate_fight(force, enemies, raw, commanded=True)
         # Trades decide: an attack that is losing value in its last 30 s is
         # broken off, whatever the strength estimate says (fog lies, kills don't).
         if action in ("attack", "pincer", "ambush") and self._attacking:
@@ -1866,7 +1868,8 @@ class RedAlertBot:
         elif action == "hold":
             self._attacking = False
             self._onward = None
-            spot = self._gate_spot(cell(d["main_x"], d["main_y"], staging))
+            chosen = cell(d["main_x"], d["main_y"], None)
+            spot = self._gate_spot(chosen, commanded=True) if chosen else self._gate_spot(staging)
             if spot and not self._recent("hold", 3.0):
                 ids = [u["id"] for u in force if _dist(_xy(u), spot) > 4 and (u.get("idle") or not self._recent("hold_all", 10.0))]
                 for chunk in _chunks(ids, max_units):
@@ -1905,12 +1908,16 @@ class RedAlertBot:
         """Inside the reach (plus TOWER_LEASH) of one of our own defenses."""
         return any(_dist(cell, _xy(b)) <= self._defense_reach(b) + TOWER_LEASH for b in self._our_defenses)
 
-    def _gate_fight(self, force: list[dict], enemies: list[dict], raw: dict) -> dict | None:
+    def _gate_fight(self, force: list[dict], enemies: list[dict], raw: dict, commanded: bool = True) -> dict | None:
         """The owner's rule: their force at our gate while we have towers means
         the army fights UNDER the towers and lets them come. What shows at the
         gate is the head of their column; the rest is in fog. The army steps
         out only when it out-matches their WHOLE known army (SURROUND_RATIO),
-        or when what came is siege that must be hunted, not waited for."""
+        or when what came is siege that must be hunted, not waited for.
+        Under LLM authority the commander's order is the highest principle:
+        the bot keeps only its own default spots under the towers, carries
+        out an order that steps out, and warns. In rules mode (no commander,
+        or LLM_AUTHORITY off) it refuses to step out ("strict")."""
         defs = self._our_defenses
         body = [u for u in force if _xy(u)]
         if not defs or not body:
@@ -1936,12 +1943,15 @@ class RedAlertBot:
         tower = min(defs, key=lambda d: _dist(_xy(d), ec))
         anchor = self._toward(_xy(tower), ec, TOWER_LINE, raw)
         return {"anchor": anchor, "tower": tower, "ec": ec, "gate": gate_s, "ours": ours, "theirs": theirs,
-                "n": len(gate), "towers": len(defs)}
+                "n": len(gate), "towers": len(defs), "strict": not (LLM_AUTHORITY and commanded),
+                "army_out": not self._under_cover(centre)}
 
-    def _gate_spot(self, cell):
-        """``cell``, or the tower line when it lies outside our towers' reach during a gate fight."""
+    def _gate_spot(self, cell, commanded: bool = False):
+        """``cell``, or the tower line when the bot's own default lies outside our
+        towers' reach during a gate fight. A cell the commander chose stands
+        (its order is the highest principle) unless the gate fight is strict."""
         g = self._gate
-        if cell is None or g is None or self._under_cover(cell):
+        if cell is None or g is None or self._under_cover(cell) or (commanded and not g["strict"]):
             return cell
         return g["anchor"]
 
@@ -1955,14 +1965,24 @@ class RedAlertBot:
         return orders
 
     def _gate_refusal(self, target, g: dict) -> None:
+        """Strict: the order out of cover was refused, say why. Under LLM authority
+        the order is carried out and the commander is warned (once per 20 s)."""
         if self._recent("gate_note", 20.0):
             return
         self._mark("gate_note")
         where = f" to {list(target)}" if target is not None else ""
-        self._problem(f"attack/pincer{where} refused: their force is at our gate ({g['gate']:.0f} in view, "
-                      f"{g['theirs']:.0f} known in all) and we have {g['towers']} towers; the army fights under them at "
-                      f"{list(g['anchor'])}. Order hold/defend there, build tanks and e3, chase when they break")
-        self.log(f"[bot] gate fight: not stepping out{where}; holding under our towers at {list(g['anchor'])}")
+        facts = (f"their force is at our gate ({g['gate']:.0f} in view, {g['theirs']:.0f} known in all; what is in view "
+                 f"is the head of their column) and we have {g['towers']} towers; the owner's rule is to fight under "
+                 f"them at {list(g['anchor'])}")
+        if g["strict"]:
+            self._problem(f"attack/pincer{where} refused: {facts}. Order hold/defend there, build tanks and e3, chase when they break")
+            self.log(f"[bot] gate fight: not stepping out{where}; holding under our towers at {list(g['anchor'])}")
+        else:
+            self._problem(f"WARNING: your order{where} takes the army OUT of our towers' reach: {facts}. It is being "
+                          f"carried out; once engaged outside there is no undo. If you did not mean to step out, order "
+                          f"hold/defend at {list(g['anchor'])} now")
+            self.log(f"[bot] gate fight: stepping out{where} on the commander's order "
+                     f"(their {g['theirs']:.0f} known vs our {g['ours']:.0f})")
 
     def _doctrine(self, raw: dict, force: list[dict], enemies: list[dict], staging, ours_s: float,
                   theirs_s: float, notes: list[str]) -> list[dict] | None:
@@ -1997,7 +2017,9 @@ class RedAlertBot:
                     self._problem(f"{len(near)} enemy units in view near their base, but their known army + towers is "
                                   f"{theirs_known + defs_s:.0f} vs our {total_ours:.0f}: no chasing into their base")
         g = self._gate
-        if g is not None and not self._under_cover(ec):
+        if g is not None and not g["strict"] and not self._under_cover(ec) and ratio >= HARASS_RATIO:
+            self._gate_refusal(None, g)  # the commander's attack goes ahead out of cover: it is warned
+        if g is not None and g["strict"] and not self._under_cover(ec):
             # The owner's rule: their force is at our gate and we have towers.
             # What shows is the head of their column; the army holds under the
             # towers and lets them walk in, whatever the ratio in view says.
@@ -2009,7 +2031,7 @@ class RedAlertBot:
             mode = (f"their {g['n']} at our gate ({ratio:.1f}x in view, their whole known army {g['theirs']:.0f} vs "
                     f"our {g['ours']:.0f}): holding under our {g['tower'].get('type')} at {list(g['anchor'])}, "
                     f"letting them walk into it")
-            self._gate_refusal(None, g)  # the commander's attack is not carried out: it is told why
+            self._gate_refusal(None, g)  # the attack is not carried out: the commander is told why
         elif ratio >= SURROUND_RATIO and cover is not None:
             # Their group sits under a defense: no ring under fire. Hold at the
             # edge of its reach and shoot what comes out; siege deals with the tower.
@@ -2038,7 +2060,7 @@ class RedAlertBot:
                 if _dist(slot, centre) > CHASE_STEP:
                     # No deep chase: step towards the slot, never run off into the fog.
                     slot = self._toward(centre, slot, CHASE_STEP, raw)
-                if g is not None and not self._under_cover(slot):
+                if g is not None and g["strict"] and not self._under_cover(slot):
                     # At our gate the ring stays inside our towers' reach.
                     slot = self._toward(_xy(g["tower"]), slot, self._defense_reach(g["tower"]) + TOWER_LEASH, raw)
                 slots.setdefault(slot, []).append(u["id"])
@@ -2194,9 +2216,10 @@ class RedAlertBot:
         alive = {u["id"]: u for u in force if _xy(u)}
         g = self._gate
         if g is not None and not self._under_cover(tuple(target)):
-            self._pincer = None
             self._gate_refusal(tuple(target), g)
-            return self._gate_hold(g, force, notes, f"pincer on {list(target)}")
+            if g["strict"]:
+                self._pincer = None
+                return self._gate_hold(g, force, notes, f"pincer on {list(target)}")
         p = self._pincer
         explicit = d_main is not None
         if p is not None and p["phase"] != "done":
@@ -2375,7 +2398,9 @@ class RedAlertBot:
             dest, why = core, f"regrouping en route ({len(near)} of {len(mine)} with the front)"
             self._held_since = None
         g = self._gate
-        if g is not None and not self._under_cover(dest):
+        if g is not None and not g["strict"] and obey and not self._under_cover(dest):
+            self._gate_refusal(target, g)  # the commander's order stands: carried out, with a warning
+        elif g is not None and g["strict"] and not self._under_cover(dest):
             # The owner's rule: with their force at our gate and towers at home,
             # the army fights under the towers; it never steps out to meet them.
             dest = g["anchor"]
