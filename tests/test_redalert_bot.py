@@ -1605,3 +1605,17 @@ def test_early_barracks_is_not_pushed_behind_the_refinery_floor():
     orders = _orders(b.choose_action(st, CTX))
     assert {"cmd": "build", "item": "barr"} in orders
     assert {"cmd": "build", "item": "proc"} not in orders
+
+
+def test_an_outnumbered_advance_party_falls_back_on_the_army_instead_of_a_whole_army_retreat():
+    party = [{"id": 100 + i, "type": "e1", "x": 60, "y": 60, "idle": False, "hp": 100} for i in range(7)]
+    # The army is strung out along the route (as in match a25b): tanks from x=36 to 50, the party ahead at 60.
+    body = [{"id": 200 + i, "type": "2tnk", "x": 36 + (i % 8) * 2, "y": 50 + (i // 8) * 2, "idle": False, "hp": 100} for i in range(40)]
+    foes = [{"id": 900 + i, "type": "3tnk", "x": 64, "y": 60 + i, "hp": 100} for i in range(2)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 60}))
+    b.rules = {"e1": {"cost": 100, "speed": 1.32}, "2tnk": {"cost": 850, "speed": 1.76}, "3tnk": {"cost": 1150, "speed": 1.56}}
+    orders = _orders(b.choose_action(_state(_base_obs(units=party + body, visible_enemies=foes)), CTX))
+    assert b._attacking  # no whole-army retreat: 700 of 34,700 is a party, not the army
+    back = [o for o in orders if o["cmd"] == "move" and set(o["units"]) == set(range(100, 107))]
+    assert back and back[-1]["to"][0] < 60  # the party falls back towards the main body
+    assert not any(o["cmd"] == "move" and set(o["units"]) & set(range(200, 240)) for o in orders)

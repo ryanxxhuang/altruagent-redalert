@@ -182,6 +182,7 @@ HOME_IDLE_MAX_S = 40.0      # an army waiting at home longer than this attacks i
 # decision counts for this long. Silent longer, the bot's own rules take over.
 LLM_STALE_S = 20.0
 CRUSHED = 0.4               # reflex: the main army retreats when this much weaker in its fight
+ADVANCE_PARTY_SHARE = 0.3   # ... unless the units in the fight are under this share of the army: they fall back on it
 # The doctrine, applied to every fight by reflex:
 #   many vs few  (>= SURROUND_RATIO): surround them and annihilate (encircle, focus fire, chase)
 #   few vs many  (<  HARASS_RATIO):   hit and run (back off while they come on, shoot when they stop)
@@ -1684,6 +1685,7 @@ class RedAlertBot:
         """Carry out the commander's army orders, with the bot's reflexes:
         micro, home defense against raids, emergency retreat."""
         self._retreat_issued = False
+        self._party_back: list[dict] = []
         alive = {u["id"]: u for u in army if isinstance(u.get("id"), int) and _xy(u)}
         self._our_strength = sum(self._strength(u) for u in alive.values())
 
@@ -1873,9 +1875,24 @@ class RedAlertBot:
                 self.log(f"[bot] commander attack #{self._wave} with {len(force)} units on {target}")
             ours_s, theirs_s = self._local_strength(force, enemies)
             if force and theirs_s > 0 and ours_s < CRUSHED * theirs_s:
-                # Reflex: crushed in a fight, get out now; the commander sees it next.
-                self._break_off(f"emergency retreat: crushed ({ours_s:.0f} vs {theirs_s:.0f})")
-                return micro + orders + self._move_home([u["id"] for u in force], staging, max_units)
+                total_s = sum(self._strength(u) for u in force)
+                party = [u for u in force if u["id"] in getattr(self, "_fight_ids", set())]
+                rest = [u for u in force if u not in party]
+                if ours_s < ADVANCE_PARTY_SHARE * total_s and rest:
+                    # An advance party, not the army, is in trouble: it falls back on
+                    # the main body and the attack stands (match a25b: two whole-army
+                    # retreats were called by 7 units out of 47 running ahead).
+                    body = self._centroid([_xy(u) for u in rest])
+                    if body and not self._recent("party_back", 3.0):
+                        self._mark("party_back")
+                        self.log(f"[bot] advance party ({ours_s:.0f}) outnumbered ({theirs_s:.0f}): falling back on the main body "
+                                 f"at {list(body)}, the attack stands")
+                        self._party_back = [{"cmd": "move", "units": chunk, "to": list(body)}
+                                            for chunk in _chunks([u["id"] for u in party], max_units)]
+                else:
+                    # Reflex: crushed in a fight, get out now; the commander sees it next.
+                    self._break_off(f"emergency retreat: crushed ({ours_s:.0f} vs {theirs_s:.0f})")
+                    return micro + orders + self._move_home([u["id"] for u in force], staging, max_units)
             fight = self._doctrine(raw, force, enemies, staging, ours_s, theirs_s, notes)
             if fight is not None:
                 orders += fight
@@ -1961,7 +1978,8 @@ class RedAlertBot:
                     continue
                 order = {**order, "units": ids}
             kept.append(order)
-        return kept + micro
+        # The advance party's fall-back goes last: it beats micro's focus fire for those units.
+        return kept + micro + self._party_back
 
     def _under_cover(self, cell) -> bool:
         """Inside the reach (plus TOWER_LEASH) of one of our own defenses."""
@@ -2534,6 +2552,7 @@ class RedAlertBot:
         body = [u for u in mine if _dist(_xy(u), core) <= COHESION_REACH] or mine
         near_foes = [f for f in foes if any(_dist(_xy(f), _xy(u)) <= FIGHT_RADIUS for u in body)]
         near_mine = [u for u in body if any(_dist(_xy(u), _xy(f)) <= FIGHT_RADIUS for f in near_foes)] or body
+        self._fight_ids = {u["id"] for u in near_mine if isinstance(u.get("id"), int)}
         return sum(self._strength(u) for u in near_mine), sum(self._strength(f) for f in near_foes)
 
     def _raid(self, raw, army, enemies, enemy_base, staging, notes) -> list[dict]:
