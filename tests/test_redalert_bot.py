@@ -1526,3 +1526,37 @@ def test_opponent_advice_calls_an_infantry_swarm_with_a_few_tanks_infantry_heavy
     foes += [{"id": 950 + i, "type": "2tnk", "x": 62, "y": 60, "hp": 100} for i in range(2)]
     b.choose_action(_state(_base_obs(visible_enemies=foes)), CTX)
     assert any("infantry-heavy (12 infantry vs 2 tanks)" in a for a in b.opponent_model()["advice"])
+
+
+def test_after_a_break_off_the_commanders_next_attack_order_stands(monkeypatch):
+    import time as _t
+    army = [{"id": 100 + i, "type": "3tnk", "x": 50, "y": 50, "idle": False, "hp": 100} for i in range(8)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 50}))
+    b.rules = {"3tnk": {"cost": 1150, "speed": 1.56}}
+    obs = _base_obs(units=army); obs["military"] = {"kills_cost": 9000, "deaths_cost": 5000}
+    st = _state(obs); st.raw["time"]["game_seconds"] = 640
+    b.choose_action(st, CTX)
+    obs2 = _base_obs(units=army[:5]); obs2["military"] = {"kills_cost": 9400, "deaths_cost": 8200}
+    st2 = _state(obs2); st2.raw["time"]["game_seconds"] = 648
+    b._sent.clear()
+    b.choose_action(st2, CTX)
+    assert not b._attacking and "until your next order" in b.status()["main_state"]
+    # The commander, asked again after the break-off, re-sends the attack: it is carried out.
+    b.advisor = FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 50})
+    b.advisor._d["asked_at"] = _t.monotonic()
+    b._sent.clear()
+    st3 = _state(obs2); st3.raw["time"]["game_seconds"] = 655
+    orders = _orders(b.choose_action(st3, CTX))
+    assert b._attacking and any(o["cmd"] == "attack_move" for o in orders)
+    # A stale decision from before the break-off does not re-engage.
+    b._break_off("test")
+    b.advisor._d["asked_at"] = b._trade_broken_at - 5
+    b._sent.clear()
+    b.choose_action(_state(obs2), CTX)
+    assert not b._attacking
+    # Rules mode: the whole cool-off holds whatever the commander says.
+    monkeypatch.setattr(__import__('agent.redalert_bot', fromlist=['x']), 'LLM_AUTHORITY', False)
+    b.advisor._d["asked_at"] = _t.monotonic() + 1
+    b._sent.clear()
+    b.choose_action(_state(obs2), CTX)
+    assert not b._attacking

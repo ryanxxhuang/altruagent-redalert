@@ -331,6 +331,7 @@ class RedAlertBot:
         self._raid_paused_until = 0.0
         self._trade_hist: deque = deque(maxlen=600)   # (game_s, kills_cost, deaths_cost)
         self._trade_broken_until = 0.0
+        self._trade_broken_at = -1e9             # when the last break-off happened (monotonic)
         self._trade_breaks: list[float] = []      # when attacks were broken off or crushed (last 5 min)
         self._opp_seen: dict[int, tuple[str, float]] = {}   # enemy unit id -> (type, last seen)
         self._opp_tags: dict[str, bool] = {}                  # rushed / raids_our_ore / turtle / chases
@@ -529,11 +530,20 @@ class RedAlertBot:
         self._trade_breaks = [t for t in self._trade_breaks if now - t < 300] + [now]
         cool = min(TRADE_COOLDOWN_S * (2 ** (len(self._trade_breaks) - 1)), TRADE_COOLDOWN_MAX_S)
         self._trade_broken_until = now + cool
+        self._trade_broken_at = now
         self._attacking = False
         self._pincer = None
-        self._main_state = f"{why}: holding at the edge for {cool:.0f}s (failed attacks in 5 min: {len(self._trade_breaks)})"
-        self.log(f"[bot] {self._main_state}")
-        self._problem(f"attack failed ({why}); no attack for {cool:.0f}s. Don't re-send it: defend, raid, siege, tech")
+        if LLM_AUTHORITY:
+            # The reflex pulls the army out; the commander's NEXT order (asked
+            # after this, with the failure in its input) decides what happens.
+            self._main_state = f"{why}: pulled back, holding at the edge until your next order (failed attacks in 5 min: {len(self._trade_breaks)})"
+            self.log(f"[bot] {self._main_state}")
+            self._problem(f"attack failed ({why}): the army pulled back out of reach. Your next order decides: re-send the "
+                          f"attack only if something changed (more tanks, siege, another approach); else defend, raid, siege, tech")
+        else:
+            self._main_state = f"{why}: holding at the edge for {cool:.0f}s (failed attacks in 5 min: {len(self._trade_breaks)})"
+            self.log(f"[bot] {self._main_state}")
+            self._problem(f"attack failed ({why}); no attack for {cool:.0f}s. Don't re-send it: defend, raid, siege, tech")
 
     def trade_window(self, seconds: float) -> tuple[float, float]:
         """(kills, deaths) gained over the last ``seconds`` of game time."""
@@ -635,7 +645,8 @@ class RedAlertBot:
                   f"({self._attacks_started} attacks); holding/defending: killed {led['holding'][0]:.0f} "
                   f"lost {led['holding'][1]:.0f}")
         if time.monotonic() < self._trade_broken_until:
-            group += "; BROKE OFF a losing trade: holding at the edge for a moment"
+            group += (f"; BROKE OFF a losing trade {time.monotonic() - self._trade_broken_at:.0f}s ago"
+                      + ("; your next attack order is carried out" if LLM_AUTHORITY else ": holding at the edge for a moment"))
         g = self._gate
         if g is not None:
             group += (f"; ENEMY AT OUR GATE: {g['n']} of theirs ({g['gate']:.0f}) within {GATE_RADIUS} cells of our "
@@ -1824,7 +1835,12 @@ class RedAlertBot:
                     return micro + orders + [{"cmd": "move", "units": chunk, "to": list(back)}
                                              for chunk in _chunks([u["id"] for u in force], max_units)]
         if action in ("attack", "pincer") and time.monotonic() < self._trade_broken_until:
-            action = "hold_edge"  # cooling off after a failed attack: hold, don't re-engage yet
+            # Cooling off after a failed attack. Under LLM authority only until the
+            # commander has been asked again (its order then stands, it knows the
+            # attack failed); in rules mode for the whole escalating cool-off.
+            decided_after = float(d.get("asked_at") or d.get("t") or 0) > self._trade_broken_at
+            if not (LLM_AUTHORITY and decided_after):
+                action = "hold_edge"
         # How long the army has been held at home: reported to the commander
         # (the playbook says not to idle); the decision stays the LLM's.
         if action == "hold" and not threats and len(force) >= 6:
