@@ -1827,10 +1827,17 @@ class RedAlertBot:
         main = [u for i, u in alive.items() if i not in self._raiders and i not in self._apc_ids() and i not in truck_ids]
         self._idle_combat = sum(1 for u in main if u.get("idle"))
         self._main_centre = self._centroid([_xy(u) for u in main]) if main else None
+        # The gate fight is judged on the whole main army, before the home guard is split off.
+        self._gate = self._gate_fight(main, enemies, raw, commanded=True)
         # Reflex: enemies at our base are fought by whoever is home.
         home = [u for u in main if base and _dist(_xy(u), base) <= 20]
         if threats and home and not self._recent("home_defense", 2.0):
-            spot = min((_xy(e) for e in threats), key=lambda c: _dist(c, base))
+            # The commander's defend cell stands; otherwise the bot's own spot,
+            # which during a gate fight stays under our towers (match 23de: the
+            # home guard walked out to the ore and was crushed).
+            chosen = cell(d["main_x"], d["main_y"], None) if d["main_action"] == "defend" else None
+            spot = self._gate_spot(chosen, commanded=True) if chosen else \
+                self._gate_spot(min((_xy(e) for e in threats), key=lambda c: _dist(c, base)))
             ids = [u["id"] for u in home if u["id"] not in controlled]
             for chunk in _chunks(ids, max_units):
                 orders.append({"cmd": "attack_move", "units": chunk, "to": list(spot)})
@@ -1840,7 +1847,6 @@ class RedAlertBot:
 
         action = d["main_action"]
         force = [u for u in main if u["id"] not in busy_home]
-        self._gate = self._gate_fight(force, enemies, raw, commanded=True)
         self._cmd_asked_at = float(d.get("asked_at") or d.get("t") or 0)
         if action not in ("attack", "pincer"):
             self._blind_stop_at = None  # a new plan: the next approach to an unseen base pauses again
@@ -1979,8 +1985,12 @@ class RedAlertBot:
             self._main_state = "retreating home"
         elif action == "defend":
             self._attacking = False
-            spot = min((_xy(e) for e in threats), key=lambda c: _dist(c, base)) if threats else (base or staging)
-            spot = self._gate_spot(spot)
+            chosen = cell(d["main_x"], d["main_y"], None)
+            if chosen:
+                spot = self._gate_spot(chosen, commanded=True)  # the commander named the spot: it stands
+            else:
+                spot = min((_xy(e) for e in threats), key=lambda c: _dist(c, base)) if threats else (base or staging)
+                spot = self._gate_spot(spot)
             if spot and not self._recent("defend_cmd", 2.0):
                 for chunk in _chunks([u["id"] for u in force], max_units):
                     orders.append({"cmd": "attack_move", "units": chunk, "to": list(spot)})

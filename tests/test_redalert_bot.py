@@ -1664,3 +1664,26 @@ def test_tech_ladder_names_the_specials_once_the_tech_centre_stands():
     obs["available_production"] += ["4tnk", "v2rl", "apwr"]
     b.choose_action(_state(obs), CTX)
     assert "next: high-tech units: 4tnk, v2rl, apwr" in b._situation()
+
+
+def test_home_guard_and_defend_stay_under_the_towers_during_a_gate_fight():
+    gun = {"id": 7, "type": "gun", "x": 30, "y": 24}
+    ore_proc = {"id": 8, "type": "proc", "x": 36, "y": 26}
+    army = [{"id": 100 + i, "type": "3tnk", "x": 30 + (i % 3), "y": 26 + (i // 3), "idle": True, "hp": 100} for i in range(6)]
+    head = [{"id": 950 + i, "type": "2tnk", "x": 42, "y": 27 + i, "hp": 100} for i in range(4)]  # at our ore refinery
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "defend"}))
+    b.rules = {"3tnk": {"cost": 1150, "speed": 1.56}, "2tnk": {"cost": 850, "speed": 1.76}, "gun": {"cost": 800}}
+    obs = _base_obs(units=army, visible_enemies=head)
+    obs["buildings"] += [gun, ore_proc]
+    far = [{"id": 900 + i, "type": "2tnk", "x": 60 + (i % 4), "y": 40 + (i // 4), "hp": 100} for i in range(12)]
+    b.choose_action(_state(dict(obs, visible_enemies=far)), CTX)  # their column was seen earlier
+    b._sent.clear()
+    orders = _orders(b.choose_action(_state(obs), CTX))
+    assert b._gate is not None
+    moves = [o for o in orders if o["cmd"] in ("attack_move", "move") and set(o["units"]) & set(range(100, 106))]
+    assert moves and all(b._under_cover(tuple(o["to"])) for o in moves)
+    # The commander names a defend spot outside cover: its call.
+    b.advisor = FakeCommander({"main_action": "defend", "main_x": 44, "main_y": 30})
+    b._sent.clear()
+    orders = _orders(b.choose_action(_state(obs), CTX))
+    assert any(o["cmd"] == "attack_move" and o["to"] == [44, 30] for o in orders)
