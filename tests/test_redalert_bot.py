@@ -1122,3 +1122,27 @@ def test_raiders_hunt_the_harvester_and_ignore_the_rifleman_next_to_them():
     assert b._raid_phase == "strike"  # a harvester in reach on the way: strike now
     shots = [o for o in orders if o["cmd"] == "attack" and set(o["units"]) == {100, 101, 102}]
     assert shots and shots[-1]["target"] == 800  # the weaker harvester, by direct order
+
+
+def test_a_losing_trade_is_broken_off_and_reported():
+    army = [{"id": 100 + i, "type": "3tnk", "x": 50, "y": 50, "idle": False, "hp": 100} for i in range(6)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 50}))
+    b.rules = {"3tnk": {"cost": 1150, "speed": 1.56}}
+    obs = _base_obs(units=army)
+    obs["military"] = {"kills_cost": 1000, "deaths_cost": 1000}
+    st = _state(obs); st.raw["time"]["game_seconds"] = 300
+    b.choose_action(st, CTX)
+    assert b._attacking
+    obs2 = _base_obs(units=army[:3])
+    obs2["military"] = {"kills_cost": 1400, "deaths_cost": 4500}  # lost 3,500 for 400 in 20 s
+    st2 = _state(obs2); st2.raw["time"]["game_seconds"] = 320
+    b._sent.clear()
+    orders = _orders(b.choose_action(st2, CTX))
+    assert not b._attacking and "broke off" in b.status()["main_state"]
+    assert any(o["cmd"] == "move" for o in orders)
+    assert "TRADE kills 1400 - deaths 4500 = -3100" in b._situation()
+    # Cooling off: an attack order holds at the edge instead of re-engaging.
+    st3 = _state(obs2); st3.raw["time"]["game_seconds"] = 325
+    b._sent.clear()
+    orders = _orders(b.choose_action(st3, CTX))
+    assert not any(o["cmd"] == "attack_move" and o["to"][0] > 55 for o in orders)

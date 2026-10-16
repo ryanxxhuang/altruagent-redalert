@@ -101,6 +101,11 @@ RAID_WITHDRAW_RATIO = 0.35  # withdraw when responders reach this share of the s
 RAID_HURT_SHARE = 0.05      # ... or when the squad has lost this share of its hp since the strike began
 RAID_BUILD_CAP = 4          # raid vehicles the bot replaces per match on its own
 RAID_PREY_RANGE = 14        # a harvester this close to the squad is attacked at once, whatever else is around
+# Trades decide the tiebreak: a fight that is losing value is broken off.
+TRADE_WINDOW_S = 30.0       # the engagement window the reflex looks at
+TRADE_BREAK_LOSS = 1200     # deaths exceed kills by this much in the window ...
+TRADE_BREAK_RATIO = 2.0     # ... and deaths are this many times the kills: break off
+TRADE_COOLDOWN_S = 20.0     # no re-engaging this long after breaking off
 RAID_LOSS_WINDOW_S = 180.0  # losing RAID_LOSS_MAX raiders within this ...
 RAID_LOSS_MAX = 2
 RAID_PAUSE_S = 120.0        # ... pauses raids (and replacements) this long
@@ -275,6 +280,8 @@ class RedAlertBot:
         self._raid_built = 0                      # raid vehicles the bot has queued itself
         self._raid_losses: list[float] = []       # when a raider died on a raid
         self._raid_paused_until = 0.0
+        self._trade_hist: deque = deque(maxlen=600)   # (game_s, kills_cost, deaths_cost)
+        self._trade_broken_until = 0.0
         self._no_queued = False                  # the server refused queued orders
         self._enemy_ore: tuple[int, int] | None = None
         self._enemy_harv_seen: dict[int, tuple[tuple[int, int], float]] = {}
@@ -454,6 +461,24 @@ class RedAlertBot:
                 needed |= {w for w in re.findall(r"[a-z0-9]+", str(pre).lower())}
         return avoid - needed
 
+    def trade_window(self, seconds: float) -> tuple[float, float]:
+        """(kills, deaths) gained over the last ``seconds`` of game time."""
+        if not self._trade_hist:
+            return 0.0, 0.0
+        now_s, k_now, d_now = self._trade_hist[-1]
+        base = next((e for e in self._trade_hist if now_s - e[0] <= seconds), self._trade_hist[0])
+        return k_now - base[1], d_now - base[2]
+
+    def _trade_line(self) -> str:
+        if not self._trade_hist:
+            return ""
+        _, k, d = self._trade_hist[-1]
+        k2, d2 = self.trade_window(120.0)
+        k30, d30 = self.trade_window(TRADE_WINDOW_S)
+        sign = lambda v: f"{v:+.0f}"  # noqa: E731
+        return (f"; TRADE kills {k:.0f} - deaths {d:.0f} = {sign(k - d)} (last 2 min {sign(k2 - d2)}, "
+                f"last 30 s {sign(k30 - d30)})")
+
     def _situation(self) -> str:
         ours = getattr(self, "_our_strength", 0)
         theirs, known = self.enemy_army_estimate()
@@ -498,7 +523,9 @@ class RedAlertBot:
         nxt = missing[0] if missing else ("tech centre (stek/atek)" if not tech_centre else "high-tech units")
         tech = f"; tech: {', '.join(done) or 'nothing yet'}; next: {nxt}"
         raiding = f" (raid squad out: tech window)" if self._raid_info.get("phase") in ("approach", "strike") else ""
-        group += tech + raiding
+        group += tech + raiding + self._trade_line()
+        if time.monotonic() < self._trade_broken_until:
+            group += "; BROKE OFF a losing trade: holding at the edge for a moment"
         return (f"our army {ours:.0f} vs their known army {total:.0f} ({ratio}); at our base {self._threat:.0f}; "
                 f"main army: {self._main_state}{held}; ahead of it {getattr(self, '_ahead', 0):.0f}{group}")
 
@@ -583,6 +610,8 @@ class RedAlertBot:
 
         game_s = (raw.get("time") or {}).get("game_seconds")
         self._game_s = float(game_s) if isinstance(game_s, (int, float)) else self._game_s
+        mil = obs.get("military") or {}
+        self._trade_hist.append((self._game_s, float(mil.get("kills_cost") or 0), float(mil.get("deaths_cost") or 0)))
         if self._rush_active and self._game_s > RUSH_UNTIL_S:
             self._rush_active = False
         self._visible_enemy_buildings = enemy_buildings
@@ -1537,6 +1566,28 @@ class RedAlertBot:
 
         action = d["main_action"]
         force = [u for u in main if u["id"] not in busy_home]
+        # Trades decide: an attack that is losing value in its last 30 s is
+        # broken off, whatever the strength estimate says (fog lies, kills don't).
+        if action in ("attack", "pincer") and self._attacking:
+            k30, d30 = self.trade_window(TRADE_WINDOW_S)
+            if d30 - k30 >= TRADE_BREAK_LOSS and d30 >= TRADE_BREAK_RATIO * max(k30, 1.0) \
+                    and time.monotonic() >= self._trade_broken_until:
+                self._trade_broken_until = time.monotonic() + TRADE_COOLDOWN_S
+                self._attacking = False
+                self._pincer = None
+                self._main_state = (f"losing the trade (last 30 s: killed {k30:.0f}, lost {d30:.0f}): broke off, "
+                                    f"holding at the edge of their reach")
+                self.log(f"[bot] {self._main_state}")
+                self._problem(f"broke off: lost {d30:.0f} for {k30:.0f} in 30 s; don't re-send the same attack, "
+                              f"change the approach (defend, pincer, siege, raid)")
+                centre = self._centroid([_xy(u) for u in force])
+                if centre and staging:
+                    back = self._flee_cell(centre, [_xy(e) for e in enemies if _xy(e) and self._is_combat(e)] or [centre],
+                                           staging, raw, 10)
+                    return micro + orders + [{"cmd": "move", "units": chunk, "to": list(back)}
+                                             for chunk in _chunks([u["id"] for u in force], max_units)]
+        if action in ("attack", "pincer") and time.monotonic() < self._trade_broken_until:
+            action = "hold_edge"  # cooling off after a losing trade: hold, don't re-engage yet
         # How long the army has been held at home: reported to the commander
         # (the playbook says not to idle); the decision stays the LLM's.
         if action == "hold" and not threats and len(force) >= 6:
@@ -1600,6 +1651,13 @@ class RedAlertBot:
                                             d_main=cell(d["main_x"], d["main_y"], None))
                 self._mark("attack")
             self._attacking = True
+        elif action == "hold_edge":
+            centre = self._centroid([_xy(u) for u in force])
+            if centre and not self._recent("hold", 3.0):
+                spot = self._out_of_reach(centre, raw)
+                for chunk in _chunks([u["id"] for u in force if _dist(_xy(u), spot) > 3], max_units):
+                    orders.append({"cmd": "attack_move", "units": chunk, "to": list(spot)})
+                self._mark("hold")
         elif action == "hold":
             self._attacking = False
             self._onward = None
