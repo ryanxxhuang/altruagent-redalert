@@ -101,11 +101,22 @@ RAID_WITHDRAW_RATIO = 0.35  # withdraw when responders reach this share of the s
 RAID_HURT_SHARE = 0.05      # ... or when the squad has lost this share of its hp since the strike began
 RAID_BUILD_CAP = 4          # raid vehicles the bot replaces per match on its own
 RAID_PREY_RANGE = 14        # a harvester this close to the squad is attacked at once, whatever else is around
+RAID_ARMY_AVOID = 16        # raids keep this far from their main army's last known position (seen within 40 s)
+RAID_BUILDING_PRIORITY = {"powr": 0, "apwr": 0, "proc": 1, "silo": 2, "weap": 3, "barr": 3, "tent": 3, "dome": 4,
+                          "fix": 4, "stek": 5, "atek": 5}
+# Ambush: the raid baits their army into a pocket between our two groups.
+AMBUSH_JAW_A = 8            # the heavy group waits this far behind the pocket (towards home)
+AMBUSH_JAW_B = 12           # the fast group waits this far to the quieter side of the pocket
+AMBUSH_BAIT_AHEAD = 7       # the bait shows itself this far in front of their group
+AMBUSH_SPRING_RANGE = 10    # chasers this close to the pocket spring the trap
+AMBUSH_WAIT_S = 45.0        # no bite after this long: bait again from the other side
+AMBUSH_TRIES = 2
 # Trades decide the tiebreak: a fight that is losing value is broken off.
 TRADE_WINDOW_S = 30.0       # the engagement window the reflex looks at
 TRADE_BREAK_LOSS = 1200     # deaths exceed kills by this much in the window ...
 TRADE_BREAK_RATIO = 2.0     # ... and deaths are this many times the kills: break off
-TRADE_COOLDOWN_S = 20.0     # no re-engaging this long after breaking off
+TRADE_COOLDOWN_S = 20.0     # no re-engaging this long after breaking off ...
+TRADE_COOLDOWN_MAX_S = 180.0  # ... doubling each time it happens again within 5 minutes, up to this
 RAID_LOSS_WINDOW_S = 180.0  # losing RAID_LOSS_MAX raiders within this ...
 RAID_LOSS_MAX = 2
 RAID_PAUSE_S = 120.0        # ... pauses raids (and replacements) this long
@@ -282,6 +293,7 @@ class RedAlertBot:
         self._raid_paused_until = 0.0
         self._trade_hist: deque = deque(maxlen=600)   # (game_s, kills_cost, deaths_cost)
         self._trade_broken_until = 0.0
+        self._trade_breaks: list[float] = []      # when attacks were broken off or crushed (last 5 min)
         self._no_queued = False                  # the server refused queued orders
         self._enemy_ore: tuple[int, int] | None = None
         self._enemy_harv_seen: dict[int, tuple[tuple[int, int], float]] = {}
@@ -311,6 +323,7 @@ class RedAlertBot:
         self._onward_for: tuple | None = None        # the commander's target that onward belongs to
         self._pincer: dict | None = None             # the current pincer: target, flank ids, phase
         self._apc: dict | None = None                # the APC raid: apc id, rider ids, phase
+        self._ambush: dict | None = None             # the ambush: pocket, jaws, bait, phase
         self._retreat_issued = False
         self._wave_peak = 0
         self._last_status = 0.0
@@ -461,6 +474,19 @@ class RedAlertBot:
                 needed |= {w for w in re.findall(r"[a-z0-9]+", str(pre).lower())}
         return avoid - needed
 
+    def _break_off(self, why: str) -> None:
+        """A failed attack: cool off before the next one, longer each time it
+        keeps happening (an army that is crushed every minute must stop)."""
+        now = time.monotonic()
+        self._trade_breaks = [t for t in self._trade_breaks if now - t < 300] + [now]
+        cool = min(TRADE_COOLDOWN_S * (2 ** (len(self._trade_breaks) - 1)), TRADE_COOLDOWN_MAX_S)
+        self._trade_broken_until = now + cool
+        self._attacking = False
+        self._pincer = None
+        self._main_state = f"{why}: holding at the edge for {cool:.0f}s (failed attacks in 5 min: {len(self._trade_breaks)})"
+        self.log(f"[bot] {self._main_state}")
+        self._problem(f"attack failed ({why}); no attack for {cool:.0f}s. Don't re-send it: defend, raid, siege, tech")
+
     def trade_window(self, seconds: float) -> tuple[float, float]:
         """(kills, deaths) gained over the last ``seconds`` of game time."""
         if not self._trade_hist:
@@ -509,6 +535,10 @@ class RedAlertBot:
         if r.get("responders") and (r.get("responders_from_their_base") or 0) >= 20:
             group += (f"; PINCER WINDOW: {r['responders']} of theirs is chasing our raid "
                       f"{r['responders_from_their_base']} cells from their base")
+        if self._ambush:
+            group += f"; AMBUSH {self._ambush['phase']} (pocket {list(self._ambush['pocket'])})"
+        elif cell and self._raid_info.get("size", 0) >= 2 and eb and _dist(cell, eb) >= 12 and age <= 60:
+            group += "; AMBUSH POSSIBLE: their army is out of their base and we have a raid squad to bait it"
         if self._raid_info:
             r = self._raid_info
             group += (f"; raid squad ({r.get('size')}): {r.get('phase')} at {r.get('at')}, responders {r.get('responders')}"
@@ -1568,18 +1598,11 @@ class RedAlertBot:
         force = [u for u in main if u["id"] not in busy_home]
         # Trades decide: an attack that is losing value in its last 30 s is
         # broken off, whatever the strength estimate says (fog lies, kills don't).
-        if action in ("attack", "pincer") and self._attacking:
+        if action in ("attack", "pincer", "ambush") and self._attacking:
             k30, d30 = self.trade_window(TRADE_WINDOW_S)
             if d30 - k30 >= TRADE_BREAK_LOSS and d30 >= TRADE_BREAK_RATIO * max(k30, 1.0) \
                     and time.monotonic() >= self._trade_broken_until:
-                self._trade_broken_until = time.monotonic() + TRADE_COOLDOWN_S
-                self._attacking = False
-                self._pincer = None
-                self._main_state = (f"losing the trade (last 30 s: killed {k30:.0f}, lost {d30:.0f}): broke off, "
-                                    f"holding at the edge of their reach")
-                self.log(f"[bot] {self._main_state}")
-                self._problem(f"broke off: lost {d30:.0f} for {k30:.0f} in 30 s; don't re-send the same attack, "
-                              f"change the approach (defend, pincer, siege, raid)")
+                self._break_off(f"losing the trade (last 30 s: killed {k30:.0f}, lost {d30:.0f})")
                 centre = self._centroid([_xy(u) for u in force])
                 if centre and staging:
                     back = self._flee_cell(centre, [_xy(e) for e in enemies if _xy(e) and self._is_combat(e)] or [centre],
@@ -1587,7 +1610,7 @@ class RedAlertBot:
                     return micro + orders + [{"cmd": "move", "units": chunk, "to": list(back)}
                                              for chunk in _chunks([u["id"] for u in force], max_units)]
         if action in ("attack", "pincer") and time.monotonic() < self._trade_broken_until:
-            action = "hold_edge"  # cooling off after a losing trade: hold, don't re-engage yet
+            action = "hold_edge"  # cooling off after a failed attack: hold, don't re-engage yet
         # How long the army has been held at home: reported to the commander
         # (the playbook says not to idle); the decision stays the LLM's.
         if action == "hold" and not threats and len(force) >= 6:
@@ -1597,6 +1620,9 @@ class RedAlertBot:
             self._holding_since = None
         if action in ("retreat", "defend") or (action == "attack" and self._pincer and _dist(self._pincer["target"], cell(d["main_x"], d["main_y"], self._pincer["target"])) > PINCER_RETARGET):
             self._pincer = None
+        if action != "ambush" and self._ambush:
+            self._ambush = None
+            self.log("[bot] ambush cancelled by the commander")
         if action == "hold" and self._pincer and self._pincer["phase"] == "closing":
             action = "pincer"  # a closing pincer finishes; "hold" doesn't stop it mid-fight
         if action == "attack":
@@ -1611,9 +1637,7 @@ class RedAlertBot:
             ours_s, theirs_s = self._local_strength(force, enemies)
             if force and theirs_s > 0 and ours_s < CRUSHED * theirs_s:
                 # Reflex: crushed in a fight, get out now; the commander sees it next.
-                self._attacking = False
-                self._main_state = f"emergency retreat: crushed ({ours_s:.0f} vs {theirs_s:.0f})"
-                self.log(f"[bot] {self._main_state}")
+                self._break_off(f"emergency retreat: crushed ({ours_s:.0f} vs {theirs_s:.0f})")
                 return micro + orders + self._move_home([u["id"] for u in force], staging, max_units)
             fight = self._doctrine(raw, force, enemies, staging, ours_s, theirs_s, notes)
             if fight is not None:
@@ -1651,6 +1675,11 @@ class RedAlertBot:
                                             d_main=cell(d["main_x"], d["main_y"], None))
                 self._mark("attack")
             self._attacking = True
+        elif action == "ambush":
+            self._attacking = True
+            if force and not self._recent("attack", 2.0):
+                orders += self._ambush_step(raw, force, enemies, cell(d["main_x"], d["main_y"], None), staging, notes)
+                self._mark("attack")
         elif action == "hold_edge":
             centre = self._centroid([_xy(u) for u in force])
             if centre and not self._recent("hold", 3.0):
@@ -1767,6 +1796,111 @@ class RedAlertBot:
         self._fight_mode = mode
         self._main_state = mode
         notes.append(mode)
+        return orders
+
+    def _ambush_step(self, raw: dict, force: list[dict], enemies: list[dict], pocket_hint, staging,
+                     notes: list[str]) -> list[dict]:
+        """Decoy and pocket: the heavy jaw waits behind the pocket, the fast
+        jaw to one side, the raid squad shows itself to their army and runs
+        back into the pocket; when chasers enter it, both jaws close."""
+        now = time.monotonic()
+        alive = {u["id"]: u for u in force if _xy(u)}
+        big, big_cell, age = self.enemy_largest_group()
+        a = self._ambush
+        if a is None:
+            centre = self._centroid([_xy(u) for u in alive.values()])
+            if not centre:
+                return []
+            their = big_cell or getattr(self, "_enemy_base_cache", None)
+            if not their:
+                self._problem("ambush: no enemy group or base known to bait; scout first")
+                return []
+            if pocket_hint:
+                pocket = tuple(pocket_hint)
+            else:
+                d = _dist(centre, their) or 1.0
+                mid = ((centre[0] + their[0]) / 2, (centre[1] + their[1]) / 2)
+                pocket = self._clamp((int(round(mid[0] + (centre[0] - their[0]) / d * 6)),
+                                      int(round(mid[1] + (centre[1] - their[1]) / d * 6))), raw)
+            d = _dist(pocket, their) or 1.0
+            ux, uy = (their[0] - pocket[0]) / d, (their[1] - pocket[1]) / d
+            jaw_a = self._clamp((int(round(pocket[0] - ux * AMBUSH_JAW_A)), int(round(pocket[1] - uy * AMBUSH_JAW_A))), raw)
+            options = {}
+            for side in (1, -1):
+                wp = self._clamp((int(round(pocket[0] - uy * AMBUSH_JAW_B * side)),
+                                  int(round(pocket[1] + ux * AMBUSH_JAW_B * side))), raw)
+                options[side] = (sum(self._strength(e) for e in self._enemy_army.values()
+                                     if _dist((e["x"], e["y"]), wp) <= 12), wp)
+            side = min(options, key=lambda k: options[k][0])
+            total = sum(self._strength(u) for u in alive.values()) or 1.0
+            fast, sf = [], 0.0
+            for u in sorted(alive.values(), key=self._speed, reverse=True):
+                if sf >= 0.35 * total or len(alive) - len(fast) <= 3:
+                    break
+                if len(fast) >= 2 and self._speed(u) < 0.8 * self._speed(alive[fast[0]]):
+                    break  # slow units stay with the heavy jaw
+                fast.append(u["id"])
+                sf += self._strength(u)
+            bait = self._clamp((int(round(their[0] - ux * AMBUSH_BAIT_AHEAD)), int(round(their[1] - uy * AMBUSH_BAIT_AHEAD))), raw)
+            a = self._ambush = {"pocket": pocket, "their": tuple(their), "jaw_a": jaw_a, "jaw_b": options[side][1],
+                                "fast": fast, "bait": bait, "phase": "set", "since": now, "tries": 0, "side": side}
+            self.log(f"[bot] ambush: pocket {list(pocket)}, heavy jaw {list(jaw_a)}, fast jaw {list(options[side][1])} "
+                     f"({len(fast)} units), bait at {list(bait)}")
+        fast = [alive[i] for i in a["fast"] if i in alive]
+        heavy = [u for i, u in alive.items() if i not in a["fast"]]
+        pocket = a["pocket"]
+        chasers = [e for e in enemies if _xy(e) and self._is_combat(e)
+                   and (_dist(_xy(e), pocket) <= AMBUSH_SPRING_RANGE or
+                        (_dist(_xy(e), pocket) <= AMBUSH_SPRING_RANGE + 8 and self._approaching(e, pocket)))]
+        c_s = sum(self._strength(e) for e in chasers)
+        ours = sum(self._strength(u) for u in alive.values())
+        orders: list[dict] = []
+        if a["phase"] in ("set", "baiting"):
+            jaws_ready = all(_dist(_xy(u), a["jaw_a"]) <= 5 for u in heavy) and all(_dist(_xy(u), a["jaw_b"]) <= 5 for u in fast)
+            if a["phase"] == "set" and jaws_ready:
+                a["phase"], a["since"] = "baiting", now
+                self._raid_target = a["bait"]
+                self.log("[bot] ambush: jaws set, bait going out")
+            if chasers and c_s >= DOCTRINE_MIN:
+                if ours >= AHEAD_EDGE * c_s:
+                    a["phase"], a["since"] = "spring", now
+                    self.log(f"[bot] ambush: SPRING, {len(chasers)} chasers ({c_s:.0f}) in the pocket vs our {ours:.0f}")
+                elif c_s > 0.8 * ours:
+                    self._ambush = None
+                    self._problem(f"ambush abandoned: what came is too strong ({c_s:.0f} vs our {ours:.0f}); defend")
+                    self.log("[bot] ambush abandoned: too strong a bite")
+                    return self._move_home([u["id"] for u in alive.values()], staging, 50)
+            if a["phase"] == "baiting" and now - a["since"] > AMBUSH_WAIT_S:
+                a["tries"] += 1
+                if a["tries"] >= AMBUSH_TRIES:
+                    self._ambush = None
+                    self._raid_target = None
+                    self._problem("ambush: no bite after two baits; their army won't chase, try attack/pincer/siege instead")
+                    self.log("[bot] ambush: no bite, done")
+                    return []
+                a["side"] = -a["side"]
+                a["since"] = now
+                self._raid_side = a["side"]
+                self.log("[bot] ambush: no bite yet, baiting again from the other side")
+            if not self._recent("ambush_hold", 3.0):
+                if heavy:
+                    orders.append({"cmd": "attack_move", "units": [u["id"] for u in heavy][:50], "to": list(a["jaw_a"])})
+                if fast:
+                    orders.append({"cmd": "attack_move", "units": [u["id"] for u in fast][:50], "to": list(a["jaw_b"])})
+                self._mark("ambush_hold")
+            why = f"ambush {a['phase']}: jaws at {list(a['jaw_a'])}/{list(a['jaw_b'])}, pocket {list(pocket)}, chasers {c_s:.0f}"
+        else:  # spring: both jaws close on the chasers; the doctrine surrounds them
+            tgt = self._centroid([_xy(e) for e in chasers]) if chasers else pocket
+            ids = [u["id"] for u in alive.values()]
+            for chunk in _chunks(ids, 50):
+                orders.append({"cmd": "attack_move", "units": chunk, "to": list(tgt)})
+            why = f"ambush sprung: closing on {len(chasers)} chasers at {list(tgt)}"
+            if not chasers and now - a["since"] > 20:
+                self._ambush = None
+                self._raid_target = None
+                self.log("[bot] ambush: done")
+        self._main_state = why
+        notes.append(why)
         return orders
 
     def _pincer_step(self, raw: dict, force: list[dict], enemies: list[dict], target, staging,
@@ -2088,8 +2222,8 @@ class RedAlertBot:
                             for e in enemies)
             if _dist(centre, target) <= 8 or (prey_near and responders == 0):
                 phase, self._raid_strike_until, self._raid_hp_start = "strike", now + RAID_STRIKE_S, hp
-            elif threatened or hurt_on_way:
-                phase = "withdraw"  # intercepted (or shot at) on the way in
+            elif threatened or hurt_on_way or self._near_their_army(centre, RAID_ARMY_AVOID - 4):
+                phase = "withdraw"  # intercepted, shot at, or drifting into their main army
         if phase == "strike":
             hurt = self._raid_hp_start > 0 and hp < self._raid_hp_start * (1 - RAID_HURT_SHARE)
             # Many vs few: nobody defending and prey in reach -> finish it off.
@@ -2149,19 +2283,31 @@ class RedAlertBot:
         elif phase == "strike":
             prey = [e for e in enemies if _xy(e) and isinstance(e.get("id"), int)
                     and str(e.get("type", "")).lower() == "harv" and _dist(_xy(e), centre) <= RAID_PREY_RANGE]
+            hp_of = lambda e: e.get("hp") if isinstance(e.get("hp"), (int, float)) else 100  # noqa: E731
             if prey:
                 if not self._recent("raid_shot", 1.5):
-                    hp_of = lambda e: e.get("hp") if isinstance(e.get("hp"), (int, float)) else 100  # noqa: E731
                     mark = min(prey, key=lambda e: (hp_of(e), _dist(_xy(e), centre)))
                     orders.append({"cmd": "attack", "units": ids, "target": mark["id"]})
                     self._mark("raid_shot")
-            elif not self._recent("raid", 2.0):
-                orders.append({"cmd": "attack_move", "units": ids, "to": list(target)})
-                self._mark("raid")
-        else:  # withdraw / reset: get away from the responders, towards home
+            else:
+                # No harvester here: an undefended building in reach (power first).
+                bld = [b for b in getattr(self, "_visible_enemy_buildings", [])
+                       if _xy(b) and isinstance(b.get("id"), int) and str(b.get("type", "")).lower() not in DEFENSE_TYPES
+                       and _dist(_xy(b), centre) <= 10 and not self._covered_by_defense(_xy(b))]
+                if bld and not self._recent("raid_shot", 1.5):
+                    mark = min(bld, key=lambda b: (RAID_BUILDING_PRIORITY.get(str(b.get("type", "")).lower(), 6), hp_of(b)))
+                    orders.append({"cmd": "attack", "units": ids, "target": mark["id"]})
+                    self._mark("raid_shot")
+                elif not self._recent("raid", 2.0):
+                    orders.append({"cmd": "attack_move", "units": ids, "to": list(target)})
+                    self._mark("raid")
+        else:  # withdraw / reset: get away from the responders, towards home (or into the ambush pocket)
             if not self._recent("raid_withdraw", 3.0):
                 threats = [_xy(e) for e in (near_foes or combat_foes)]
-                if threats:
+                amb = self._ambush
+                if amb and amb["phase"] in ("set", "baiting"):
+                    dest = amb["pocket"]  # the bait leads them into the pocket
+                elif threats:
                     dest = self._flee_cell(centre, threats, staging or getattr(self, "_base_cell", None), raw, RAID_WITHDRAW_STEP)
                 elif staging and _dist(centre, staging) > 10:
                     dest = self._toward(centre, staging, 12, raw)
@@ -2322,34 +2468,70 @@ class RedAlertBot:
             orders.append({"cmd": "attack_move", "units": ids, "to": list(target), "queued": True})
         return orders
 
+    def _near_their_army(self, cell, radius: float = RAID_ARMY_AVOID) -> bool:
+        """Do known enemy combat units (seen within 40 s) worth DOCTRINE_MIN or
+        more stand within ``radius`` of ``cell``? A lone tank guarding an ore
+        field counts as much as the main army for a raid squad."""
+        now = time.monotonic()
+        near = sum(self._strength(e) for e in self._enemy_army.values()
+                   if now - e["t"] <= 40 and _dist((e["x"], e["y"]), cell) <= radius)
+        return near >= DOCTRINE_MIN
+
+    def _raid_building_target(self) -> tuple[int, int] | None:
+        """An undefended enemy building away from their army: power first."""
+        big, big_cell, age = self.enemy_largest_group()
+        options = []
+        for b in self._enemy_buildings.values():
+            t = str(b.get("type", "")).lower()
+            c = _xy(b)
+            if not c or t in DEFENSE_TYPES or t == "fact":
+                continue
+            if self._covered_by_defense(c) or self._near_their_army(c) or self._raid_hot_now(c):
+                continue
+            far = _dist(c, big_cell) if big_cell and age <= 40 else 0.0
+            options.append((RAID_BUILDING_PRIORITY.get(t, 6), -far, c))
+        if not options:
+            return None
+        options.sort()
+        return options[0][2]
+
     def _raid_hot_now(self, cell) -> bool:
         key = (int(cell[0]) // 6, int(cell[1]) // 6)
         now = time.monotonic()
         return sum(1 for t in self._raid_hot.get(key, []) if now - t < 90) >= 2
 
     def _raid_cell(self, enemy_base) -> tuple[int, int] | None:
-        """Where enemy harvesters are, outside the reach of their defenses and
+        """The ambush bait point while an ambush is set; else where enemy
+        harvesters are, outside the reach of their defenses and
         not somewhere the squad keeps getting driven off: one seen recently,
         else the part of the ore field by their base that no known defense
         covers. None when every option is covered or hot."""
+        if self._ambush and self._ambush["phase"] in ("set", "baiting"):
+            return self._ambush["bait"]
         now = time.monotonic()
-        recent = [c for c, t in self._enemy_harv_seen.values()
-                  if now - t < 45 and not self._covered_by_defense(c) and not self._raid_hot_now(c)]
+        ok = lambda c: not self._covered_by_defense(c) and not self._raid_hot_now(c) and not self._near_their_army(c)  # noqa: E731
+        recent = [c for c, t in self._enemy_harv_seen.values() if now - t < 45 and ok(c)]
         if recent:
             return recent[-1]
-        if self._raid_target and not self._covered_by_defense(self._raid_target):
+        if self._raid_target and ok(self._raid_target):
             return self._raid_target
         if not enemy_base:
             return None
         cells = _ore_cells_near(self._config, enemy_base) or [enemy_base]
-        safe = [c for c in cells if not self._covered_by_defense(c) and not self._raid_hot_now(c)]
-        if not safe:
-            if not self._recent("raid_covered_note", 20.0):
-                self._mark("raid_covered_note")
-                self._problem("every ore field near their base is covered by their defenses: raid elsewhere "
-                              "(give raid_x/raid_y) or bring siege units")
-            return None
-        return max(safe, key=lambda c: sum(1 for o in safe if _dist(o, c) <= 4))
+        safe = [c for c in cells if ok(c)]
+        if safe:
+            big, big_cell, age = self.enemy_largest_group()
+            # The densest patch, preferring the side away from their army.
+            return max(safe, key=lambda c: (sum(1 for o in safe if _dist(o, c) <= 4)
+                                            + (0.3 * _dist(c, big_cell) if big_cell and age <= 40 else 0)))
+        building = self._raid_building_target()
+        if building:
+            return building
+        if not self._recent("raid_covered_note", 20.0):
+            self._mark("raid_covered_note")
+            self._problem("nothing safe to raid: their army or defenses cover every ore field and building we know; "
+                          "raids wait (give raid_x/raid_y to override)")
+        return None
 
     def _wave_size(self, raw: dict, army: list[dict] | None = None) -> int:
         n_inf = sum(1 for u in army or [] if str(u.get("type", "")).lower() in ("e1", "e2", "e3", "e4"))

@@ -1146,3 +1146,61 @@ def test_a_losing_trade_is_broken_off_and_reported():
     b._sent.clear()
     orders = _orders(b.choose_action(st3, CTX))
     assert not any(o["cmd"] == "attack_move" and o["to"][0] > 55 for o in orders)
+
+
+def test_ambush_sets_jaws_then_springs_on_chasers():
+    import time as _t
+    heavy = [{"id": 100 + i, "type": "3tnk", "x": 40, "y": 50, "idle": True, "hp": 100} for i in range(5)]
+    fast = [{"id": 200 + i, "type": "ftrk", "x": 40, "y": 50, "idle": True, "hp": 100} for i in range(2)]
+    raid = [{"id": 300 + i, "type": "jeep", "x": 30, "y": 30, "idle": True, "hp": 100} for i in range(2)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "ambush", "raid_size": 2, "raid_unit": "jeep"}))
+    b.rules = {"3tnk": {"cost": 1150, "speed": 1.56}, "ftrk": {"cost": 600, "speed": 2.76}, "jeep": {"cost": 500, "speed": 4.0},
+               "2tnk": {"cost": 850, "speed": 1.76}}
+    b._enemy_army = {900 + i: {"type": "2tnk", "hp": 100, "x": 80, "y": 50, "t": _t.monotonic()} for i in range(3)}
+    b._enemy_army_seen_at = _t.monotonic()
+    orders = _orders(b.choose_action(_state(_base_obs(units=heavy + fast + raid)), CTX))
+    a = b._ambush
+    assert a and a["phase"] == "set" and a["pocket"][0] < 80 and set(a["fast"]) == {200, 201}
+    assert b._raid_cell((80, 50)) == a["bait"]  # the raid is the bait
+    # Jaws in place: baiting. Then three enemy tanks chase into the pocket: spring.
+    placed = [{**u, "x": a["jaw_a"][0], "y": a["jaw_a"][1]} for u in heavy] + [{**u, "x": a["jaw_b"][0], "y": a["jaw_b"][1]} for u in fast]
+    b._sent.clear()
+    b.choose_action(_state(_base_obs(units=placed + raid)), CTX)
+    assert b._ambush["phase"] == "baiting"
+    chasers = [{"id": 900 + i, "type": "2tnk", "x": a["pocket"][0] + 3, "y": a["pocket"][1], "hp": 100} for i in range(3)]
+    b._sent.clear()
+    orders = _orders(b.choose_action(_state(_base_obs(units=placed + raid, visible_enemies=chasers)), CTX))
+    assert b._ambush["phase"] == "spring"
+    engaged = {i for o in orders if o["cmd"] in ("attack_move", "attack") for i in o["units"]}
+    assert {100, 200} <= engaged  # both jaws go in (micro gives the ones in range their targets)
+
+
+def test_raid_picks_the_side_away_from_their_army_and_undefended_buildings():
+    import time as _t
+    b = bot()
+    b._config = {"rules": {"maps": {"m": {"spawns": [[80, 80]], "layout": {
+        "origin": [0, 0], "rows": ["." * 100] * 70 + ["." * 66 + "$$$" + "." * 21 + "$$$" + "." * 7] * 3 + ["." * 100] * 27}}}}}
+    b.rules = {"3tnk": {"cost": 1150}}
+    # Their army sits on the eastern patch (90, 71): raid the western one.
+    b._enemy_army = {900 + i: {"type": "3tnk", "hp": 100, "x": 90, "y": 71, "t": _t.monotonic()} for i in range(4)}
+    b._enemy_army_seen_at = _t.monotonic()
+    cell = b._raid_cell((80, 80))
+    assert cell and cell[0] <= 69
+    # Their army moves onto the western patch too: an undefended power plant far from it is next.
+    b._enemy_army = {900 + i: {"type": "3tnk", "hp": 100, "x": 67, "y": 71, "t": _t.monotonic()} for i in range(4)}
+    b._enemy_army[950] = {"type": "3tnk", "hp": 100, "x": 90, "y": 71, "t": _t.monotonic()}
+    b._enemy_buildings = {960: {"id": 960, "type": "powr", "x": 95, "y": 90}, 961: {"id": 961, "type": "proc", "x": 70, "y": 75}}
+    assert b._raid_cell((80, 80)) == (95, 90)
+
+
+def test_repeated_failed_attacks_cool_off_longer_each_time():
+    from agent import redalert_bot as rb
+    b = bot()
+    b._break_off("test")
+    first = b._trade_broken_until - __import__("time").monotonic()
+    b._break_off("test")
+    second = b._trade_broken_until - __import__("time").monotonic()
+    assert abs(first - rb.TRADE_COOLDOWN_S) < 1 and abs(second - 2 * rb.TRADE_COOLDOWN_S) < 1
+    for _ in range(6):
+        b._break_off("test")
+    assert b._trade_broken_until - __import__("time").monotonic() <= rb.TRADE_COOLDOWN_MAX_S + 1

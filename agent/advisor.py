@@ -68,7 +68,7 @@ TACTICAL_SCHEMA = {
         "infantry_count": {"type": "integer"},
         "vehicle": {"type": "string"},
         "vehicle_count": {"type": "integer"},
-        "main_action": {"type": "string", "enum": ["attack", "pincer", "hold", "retreat", "defend"]},
+        "main_action": {"type": "string", "enum": ["attack", "pincer", "ambush", "hold", "retreat", "defend"]},
         "main_x": {"type": "integer"},
         "main_y": {"type": "integer"},
         "raid_size": {"type": "integer"},
@@ -140,7 +140,11 @@ Army:
 NOT stop for what is ahead, you decide that from bot.strength_ahead), pincer (FRONT AND BACK: the bot splits the \
 army, the fastest ~40% circle round to the far side of main_x/main_y while the rest close to ~12 cells in front and \
 wait; when the flank is in place both hit at once; use it on their army in the field or on a base defended from \
-one side), hold (gather at main_x, main_y), retreat (go home), defend (fight the enemies near our base). \
+one side), ambush (DECOY AND POCKET: the bot splits the army into a heavy jaw and a fast jaw either side of a pocket \
+between us and their army, sends the raid squad to show itself in front of their army and run back into the \
+pocket, and when chasers enter it both jaws close; needs a raid squad of 2+ and their army in the field; the \
+situation says "AMBUSH POSSIBLE" when the pieces are there; main_x/main_y = the pocket, -1 for automatic), \
+hold (gather at main_x, main_y), retreat (go home), defend (fight the enemies near our base). \
 main_x/main_y: -1 = default (their largest known army group for pincer, else the enemy base for attack, our \
 staging point for hold).
 - raid_size: how many units form the raid squad (0 recalls it; the general's standing_raid is the minimum the \
@@ -408,7 +412,7 @@ class Commanders:
             except (TypeError, ValueError):
                 return default
 
-        action = a.get("main_action") if a.get("main_action") in ("attack", "pincer", "hold", "retreat", "defend") else "hold"
+        action = a.get("main_action") if a.get("main_action") in ("attack", "pincer", "ambush", "hold", "retreat", "defend") else "hold"
         decision = {
             "build": name("build"), "defense": name("defense"),
             "infantry": name("infantry"), "infantry_count": num("infantry_count", 1, 5, 2),
