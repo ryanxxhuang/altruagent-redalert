@@ -105,7 +105,9 @@ defensive (more static defenses, bigger waves).
 - unit_focus: tanks, infantry, mixed, anti_armor (more rocket infantry).
 - defenses: static defenses to keep (0-6). max_refineries: 1-5.
 - build_targets: up to 4 {item, count} the bot reaches FIRST, before anything else, e.g. [{"item": "proc", \
-"count": 2}, {"item": "harv", "count": 4}]. Counts are totals you want to own (buildings or units); names from \
+"count": 2}, {"item": "harv", "count": 4}]. Walk the tech ladder once the basics are up: dome, then stek/atek, \
+then 4tnk/ttnk/v2rl (Soviets) or arty/2tnk/ctnk/stnk (Allies), plus a 3rd proc; the situation line says \
+"tech: ... next: ...". Counts are totals you want to own (buildings or units); names from \
 available_production / my_buildings / my_units. [] to leave it alone. The bot keeps power positive by itself.
 - avoid: items the bot must not build or train until your next call, e.g. ["dome"] to save money. [] for none. \
 Never avoid a prerequisite of something you want (the bot ignores such an avoid anyway).

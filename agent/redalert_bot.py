@@ -98,7 +98,11 @@ RAID_STRIKE_S = 6.0         # hit for a few seconds, then go, whatever happens
 RAID_RESPONSE_RANGE = 9     # enemy combat units this close to the squad count as responders
 RAID_ALERT_RANGE = 13       # ... and these, if they are coming at us
 RAID_WITHDRAW_RATIO = 0.35  # withdraw when responders reach this share of the squad's strength
-RAID_HURT_SHARE = 0.12      # ... or when the squad has lost this share of its hp since the strike began
+RAID_HURT_SHARE = 0.05      # ... or when the squad has lost this share of its hp since the strike began
+RAID_BUILD_CAP = 4          # raid vehicles the bot replaces per match on its own
+RAID_LOSS_WINDOW_S = 180.0  # losing RAID_LOSS_MAX raiders within this ...
+RAID_LOSS_MAX = 2
+RAID_PAUSE_S = 120.0        # ... pauses raids (and replacements) this long
 RAID_SAFE_RANGE = 14        # withdrawn once every enemy combat unit is this far away ...
 RAID_NOT_CHASED_S = 2.0     # ... or none has come closer for this long (they stopped chasing)
 RAID_WITHDRAW_MAX_S = 12.0  # or after this long
@@ -267,6 +271,9 @@ class RedAlertBot:
         self._raid_hp_start = 0.0                # squad hp when the strike began
         self._raid_last_chased = 0.0             # when an enemy last came closer to the squad
         self._raid_hot: dict[tuple[int, int], list[float]] = {}  # target -> times the squad was driven off there
+        self._raid_built = 0                      # raid vehicles the bot has queued itself
+        self._raid_losses: list[float] = []       # when a raider died on a raid
+        self._raid_paused_until = 0.0
         self._no_queued = False                  # the server refused queued orders
         self._enemy_ore: tuple[int, int] | None = None
         self._enemy_harv_seen: dict[int, tuple[tuple[int, int], float]] = {}
@@ -480,6 +487,17 @@ class RedAlertBot:
             r = self._raid_info
             group += (f"; raid squad ({r.get('size')}): {r.get('phase')} at {r.get('at')}, responders {r.get('responders')}"
                       + (f" ({r.get('responders_from_their_base')} cells from their base)" if r.get("responders") else ""))
+        have = getattr(self, "_btypes", Counter())
+        ladder = [("proc", 2), ("weap", 1), ("fix", 1), ("dome", 1), ("stek", 1), ("atek", 1)]
+        done = [f"{k}{'' if n == 1 else 'x' + str(n)}" for k, n in ladder if have[k] >= n and k not in ("stek", "atek")]
+        tech_centre = "stek" if have["stek"] else ("atek" if have["atek"] else None)
+        if tech_centre:
+            done.append(tech_centre)
+        missing = [k for k, n in ladder[:4] if have[k] < n]
+        nxt = missing[0] if missing else ("tech centre (stek/atek)" if not tech_centre else "high-tech units")
+        tech = f"; tech: {', '.join(done) or 'nothing yet'}; next: {nxt}"
+        raiding = f" (raid squad out: tech window)" if self._raid_info.get("phase") in ("approach", "strike") else ""
+        group += tech + raiding
         return (f"our army {ours:.0f} vs their known army {total:.0f} ({ratio}); at our base {self._threat:.0f}; "
                 f"main army: {self._main_state}{held}; ahead of it {getattr(self, '_ahead', 0):.0f}{group}")
 
@@ -835,15 +853,17 @@ class RedAlertBot:
             else:
                 fast_owned = sum(1 for u in army if self._speed(u) >= RAID_FAST) + sum(
                     queued[v] for v in RAID_VEHICLES)
-            if fast_owned < (1 if apc_mode else d["raid_size"]):
+            paused = time.monotonic() < self._raid_paused_until
+            if fast_owned < (1 if apc_mode else d["raid_size"]) and self._raid_built < RAID_BUILD_CAP and not paused:
                 want = str(d.get("raid_unit") or "").lower()
                 options = ([want] if want in RAID_VEHICLES else []) + list(RAID_VEHICLES)
                 item = next((v for v in options if v in available and not self._blocked_now(v)), None)
                 if item:
                     orders.append({"cmd": "train", "item": item, "count": 1})
                     self._mark("vehicle")
+                    self._raid_built += 1
                     busy = busy | {"Vehicle"}
-                    notes.append(f"training {item} for the raid squad")
+                    notes.append(f"training {item} for the raid squad ({self._raid_built}/{RAID_BUILD_CAP})")
         if d:
             for queue, key in (("Vehicle", "vehicle"), ("Infantry", "infantry")):
                 want = d.get(key, "auto")
@@ -1398,6 +1418,16 @@ class RedAlertBot:
             return self._clamp((x, y), raw) if x >= 0 and y >= 0 else default
 
         # The raid squad's phase comes first: micro leaves a withdrawing squad alone.
+        now_t = time.monotonic()
+        lost = [i for i in self._raiders if i not in alive]
+        if lost and self._raid_phase in ("approach", "strike", "withdraw"):
+            self._raid_losses += [now_t] * len(lost)
+            self._raid_losses = [t for t in self._raid_losses if now_t - t < RAID_LOSS_WINDOW_S]
+            if len(self._raid_losses) >= RAID_LOSS_MAX and now_t >= self._raid_paused_until:
+                self._raid_paused_until = now_t + RAID_PAUSE_S
+                self._problem(f"raids paused {RAID_PAUSE_S:.0f}s: {len(self._raid_losses)} raid vehicles lost in "
+                              f"{RAID_LOSS_WINDOW_S:.0f}s; their ore is guarded, pick another raid_x/raid_y or wait")
+                self.log(f"[bot] raids paused: {len(self._raid_losses)} raiders lost recently")
         self._raiders &= set(alive)
         rtarget = cell(d["raid_x"], d["raid_y"], None)
         if rtarget and self._covered_by_defense(rtarget):
@@ -1434,7 +1464,9 @@ class RedAlertBot:
         standing = int(self.knobs.get("standing_raid", 0) or 0)
         fast_free = sum(1 for i, u in alive.items() if self._speed(u) >= RAID_FAST and i not in self._apc_ids())
         floor = min(RAID_FLOOR, fast_free) if fast_free >= RAID_FLOOR else 0
-        if not apc_mode and self._threat <= 0 and rtarget is not None:
+        if time.monotonic() < self._raid_paused_until:
+            size = 0  # too many raiders lost lately: everyone stays home for a while
+        elif not apc_mode and self._threat <= 0 and rtarget is not None:
             if standing > size and len(alive) >= standing + 4:
                 size = standing
             if floor > size and d["raid_size"] <= 0:
@@ -1987,7 +2019,8 @@ class RedAlertBot:
             self._raid_last_chased = now
         phase = self._raid_phase
         under_fire = any(str(e.get("type", "")).lower() in DEFENSE_RANGE for e in near_foes)
-        threatened = responders >= RAID_WITHDRAW_RATIO * squad_s or under_fire
+        # Any responder at all ends the visit: the squad's job is to stay alive.
+        threatened = responders > 0 or under_fire
         if phase == "approach":
             if self._raid_hp_start <= 0 or hp > self._raid_hp_start:
                 self._raid_hp_start = hp

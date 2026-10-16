@@ -769,7 +769,7 @@ def test_raid_hit_and_run_cycle():
 
 def test_raiders_shoot_harvesters_not_tanks():
     squad = [{"id": 100 + i, "type": "ftrk", "x": 72, "y": 72, "idle": True, "hp": 100} for i in range(3)]
-    foes = [{"id": 800, "type": "harv", "x": 75, "y": 72, "hp": 100}, {"id": 900, "type": "3tnk", "x": 74, "y": 74, "hp": 40}]
+    foes = [{"id": 800, "type": "harv", "x": 75, "y": 72, "hp": 100}, {"id": 900, "type": "3tnk", "x": 82, "y": 80, "hp": 40}]
     b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 3, "raid_x": 75, "raid_y": 72}))
     b.rules = {"ftrk": {"cost": 600, "speed": 2.76}, "3tnk": {"cost": 1150}, "harv": {"cost": 1100}}
     b._raiders = {100, 101, 102}
@@ -1064,3 +1064,49 @@ def test_raid_avoids_a_target_it_keeps_getting_driven_off():
     b._config = {"rules": {"maps": {"m": {"spawns": [[80, 80]], "layout": {
         "origin": [0, 0], "rows": ["." * 100] * 72 + ["." * 72 + "$$$$" + "." * 24] * 3 + ["." * 100] * 25}}}}}
     assert b._raid_cell((80, 80)) is None  # the only patch is hot: no raid there for now
+
+
+def test_raid_leaves_at_the_first_responder_and_on_any_damage():
+    squad = [{"id": 100 + i, "type": "jeep", "x": 72, "y": 72, "idle": True, "hp": 100} for i in range(3)]
+    harv = [{"id": 800, "type": "harv", "x": 74, "y": 73, "hp": 100}]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 3, "raid_x": 74, "raid_y": 73}))
+    b.rules = {"jeep": {"cost": 500, "speed": 4.0}, "harv": {"cost": 1100}, "e1": {"cost": 100, "speed": 1.32}}
+    b.choose_action(_state(_base_obs(units=squad, visible_enemies=harv)), CTX)
+    assert b._raid_phase == "strike"
+    one_rifleman = harv + [{"id": 901, "type": "e1", "x": 78, "y": 73, "hp": 100}]  # a single rifleman shows up
+    b._sent.clear()
+    b.choose_action(_state(_base_obs(units=squad, visible_enemies=one_rifleman)), CTX)
+    assert b._raid_phase == "withdraw"
+    b2 = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 3, "raid_x": 74, "raid_y": 73}))
+    b2.rules = b.rules
+    b2.choose_action(_state(_base_obs(units=squad, visible_enemies=harv)), CTX)
+    b2._sent.clear()
+    b2.choose_action(_state(_base_obs(units=[{**u, "hp": 94} for u in squad], visible_enemies=harv)), CTX)
+    assert b2._raid_phase == "withdraw"  # 6% damage: go
+
+
+def test_raids_pause_after_losing_two_vehicles_and_replacements_are_capped():
+    from agent import redalert_bot as rb
+    squad = [{"id": 100 + i, "type": "jeep", "x": 60, "y": 60, "idle": True, "hp": 100} for i in range(3)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 3, "raid_x": 80, "raid_y": 60}))
+    b.rules = {"jeep": {"cost": 500, "speed": 4.0}}
+    b.choose_action(_state(_base_obs(units=squad)), CTX)
+    assert len(b._raiders) == 3
+    b._sent.clear()
+    b.choose_action(_state(_base_obs(units=squad[2:])), CTX)  # two jeeps died on the raid
+    assert b._raid_paused_until > 0 and not b._raiders
+    assert any("raids paused" in p for p in b.status()["problems"])
+    b3 = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 3, "raid_unit": "jeep"}))
+    b3.rules = b.rules
+    b3._raid_built = rb.RAID_BUILD_CAP
+    obs = _base_obs(); obs["available_production"] = obs["available_production"] + ["jeep"]
+    orders = _orders(b3.choose_action(_state(obs), CTX))
+    assert not any(o["cmd"] == "train" and o["item"] == "jeep" for o in orders)
+
+
+def test_situation_shows_the_tech_ladder():
+    b = bot()
+    b._btypes = __import__("collections").Counter({"proc": 2, "weap": 1, "fix": 1})
+    assert "next: dome" in b._situation()
+    b._btypes["dome"] = 1
+    assert "next: tech centre" in b._situation()
