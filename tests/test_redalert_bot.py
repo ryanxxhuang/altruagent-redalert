@@ -1338,7 +1338,8 @@ def test_economy_floor_harvesters_and_refineries_first():
     obs = _base_obs()
     obs["buildings"] = [b_ for b_ in obs["buildings"] if b_["id"] != 6]       # 1 refinery
     obs["units"] = [u for u in obs["units"] if u["type"] != "harv"][:0] + [{"id": 50, "type": "harv", "x": 30, "y": 30}]  # 1 harvester
-    orders = _orders(b.choose_action(_state(obs), CTX))
+    st0 = _state(obs); st0.raw["time"]["game_seconds"] = 150  # after 2:00 the floor wants the 2nd refinery
+    orders = _orders(b.choose_action(st0, CTX))
     assert any(o["cmd"] == "train" and o["item"] == "harv" for o in orders)      # 2 per refinery first
     assert not any(o["cmd"] == "train" and o["item"] == "3tnk" for o in orders)
     assert {"cmd": "build", "item": "proc"} in orders                           # the 2nd refinery before the dome
@@ -1592,3 +1593,15 @@ def test_no_pause_at_a_base_someone_has_looked_inside():
     moves = [o for o in orders if o["cmd"] == "attack_move" and set(o["units"]) & set(range(100, 106))]
     assert moves and any(_dist(tuple(o["to"]), (80, 80)) <= 18 for o in moves)
     assert "interior never seen" not in b.status()["main_state"]
+
+
+def test_early_barracks_is_not_pushed_behind_the_refinery_floor():
+    # 0:40, one refinery, the commander wants the barracks: it is built now; the floor backstops the 2nd refinery only from 2:00.
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"build": "barr"}))
+    obs = _base_obs()
+    obs["buildings"] = [b_ for b_ in obs["buildings"] if b_["id"] not in (3, 6)]  # 1 refinery, no barracks yet
+    obs["available_production"] = ["powr", "proc", "barr", "harv", "e1"]
+    st = _state(obs); st.raw["time"]["game_seconds"] = 40
+    orders = _orders(b.choose_action(st, CTX))
+    assert {"cmd": "build", "item": "barr"} in orders
+    assert {"cmd": "build", "item": "proc"} not in orders

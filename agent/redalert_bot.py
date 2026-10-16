@@ -116,7 +116,7 @@ RAID_BUILDING_PRIORITY = {"powr": 0, "apwr": 0, "proc": 1, "silo": 2, "weap": 3,
 # vehicle; the 2nd refinery by 2:00 and the 3rd by 6:00 when the money is there.
 HARV_PER_PROC = 2
 HARV_CAP = 8
-PROC_SCHEDULE = ((2, 0.0), (3, 300.0))   # (refineries wanted, from game second)
+PROC_SCHEDULE = ((1, 0.0), (2, 120.0), (3, 300.0))   # (refineries wanted, from game second): a backstop behind the commander, not ahead of it
 # LLM authority: the LLM commands; the bot's own strategic guards (raid floor,
 # counter-build, tech block, ambush refusal, escalating cool-off) only advise.
 LLM_AUTHORITY = os.environ.get("LLM_AUTHORITY", "1") not in ("0", "false", "no")
