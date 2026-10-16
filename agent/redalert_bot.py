@@ -143,6 +143,7 @@ TRADE_FAST_WINDOW_S = 10.0  # bleeding: losing TRADE_FAST_LOSS in this long (kil
 TRADE_FAST_LOSS = 2500
 CLOCK_LATE_S = 600.0        # the clock rule is spelled out with this much time left
 BASE_SEEN_RANGE = 12        # one of our units this close to their base centre has seen its interior
+BLIND_STEP_RADIUS = 18      # the army does not step this close to a base nobody has seen inside without a nod
 RAID_LOSS_WINDOW_S = 180.0  # losing RAID_LOSS_MAX raiders within this ...
 RAID_LOSS_MAX = 2
 RAID_PAUSE_S = 120.0        # ... pauses raids (and replacements) this long
@@ -355,6 +356,8 @@ class RedAlertBot:
         self._enemy_army_seen_at = -1e9          # when we last saw any enemy combat unit
         self._remaining_s: float | None = None   # seconds left on the match clock
         self._their_base_seen_at: float | None = None  # game second one of our units last stood inside their base
+        self._blind_stop_at: float | None = None  # when the army stopped at the edge of an unseen base (monotonic)
+        self._cmd_asked_at = 0.0                 # when the commander was asked for its current decision
         self._held_since: float | None = None
         self._decision: dict | None = None           # the field commander's latest decision
         self._consumed: set[tuple[int, str]] = set() # one-shot parts of decisions already done
@@ -1818,6 +1821,9 @@ class RedAlertBot:
         action = d["main_action"]
         force = [u for u in main if u["id"] not in busy_home]
         self._gate = self._gate_fight(force, enemies, raw, commanded=True)
+        self._cmd_asked_at = float(d.get("asked_at") or d.get("t") or 0)
+        if action not in ("attack", "pincer"):
+            self._blind_stop_at = None  # a new plan: the next approach to an unseen base pauses again
         # Trades decide: an attack that is losing value in its last 30 s is
         # broken off, whatever the strength estimate says (fog lies, kills don't).
         if action in ("attack", "pincer", "ambush") and self._attacking:
@@ -2450,6 +2456,25 @@ class RedAlertBot:
         else:
             dest, why = core, f"regrouping en route ({len(near)} of {len(mine)} with the front)"
             self._held_since = None
+        eb = getattr(self, "_enemy_base_cache", None)
+        if obey and eb is not None and self._their_base_seen_at is None and dest != core \
+                and _dist(dest, eb) <= BLIND_STEP_RADIUS < _dist(core, eb):
+            # Every big loss came from this step: walking into a base nobody has
+            # seen inside. The army pauses here once; a scout, or the commander
+            # ordering the attack again with this in its input, sends it on.
+            if self._blind_stop_at is None:
+                self._blind_stop_at = time.monotonic()
+            if self._cmd_asked_at <= self._blind_stop_at:
+                dest = self._out_of_reach(core, raw)
+                why = (f"at the edge of their base ({_dist(core, eb):.0f} cells), interior never seen: "
+                       f"holding for a scout or your confirmation")
+                self._held_since = None
+                if not self._recent("blind_note", 20.0):
+                    self._mark("blind_note")
+                    self._problem(f"the army stopped {_dist(core, eb):.0f} cells from their base: nobody has seen inside it, "
+                                  f"its towers are unknown. Send a scout (raid_size 1, a jeep/flak truck) or order the "
+                                  f"attack again to go in blind")
+                    self.log(f"[bot] blind step: holding at the edge of their unseen base at {list(core)}")
         g = self._gate
         if g is not None and not g["strict"] and obey and not self._under_cover(dest):
             self._gate_refusal(target, g)  # the commander's order stands: carried out, with a warning

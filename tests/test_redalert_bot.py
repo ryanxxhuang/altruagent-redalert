@@ -2,7 +2,7 @@ from altruagent import WAIT, DecisionContext, WithReasoning
 from altruagent.models import GameState
 
 from agent.agent import Agent
-from agent.redalert_bot import RedAlertBot
+from agent.redalert_bot import _dist, RedAlertBot
 
 
 def _state(obs, legal=None, remaining=1000):
@@ -1560,3 +1560,35 @@ def test_after_a_break_off_the_commanders_next_attack_order_stands(monkeypatch):
     b._sent.clear()
     b.choose_action(_state(obs2), CTX)
     assert not b._attacking
+
+
+def test_the_army_pauses_at_the_edge_of_an_unseen_base_until_scouted_or_confirmed():
+    import time as _t
+    army = [{"id": 100 + i, "type": "3tnk", "x": 62 + (i % 3), "y": 64 + (i // 3), "idle": False, "hp": 100} for i in range(6)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 80}))
+    b.rules = {"3tnk": {"cost": 1150, "speed": 1.56}}
+    orders = _orders(b.choose_action(_state(_base_obs(units=army)), CTX))  # their base is at [80, 80], 24 cells away
+    moves = [o for o in orders if o["cmd"] == "attack_move" and set(o["units"]) & set(range(100, 106))]
+    assert moves and all(_dist(tuple(o["to"]), (80, 80)) > 18 for o in moves)
+    assert "interior never seen" in b.status()["main_state"]
+    assert any("nobody has seen inside" in p for p in b.status()["problems"])
+    # The commander, asked after the stop, orders the attack again: the army goes in.
+    b.advisor = FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 80})
+    b.advisor._d["asked_at"] = _t.monotonic() + 0.01
+    b._sent.clear()
+    orders = _orders(b.choose_action(_state(_base_obs(units=army)), CTX))
+    moves = [o for o in orders if o["cmd"] == "attack_move" and set(o["units"]) & set(range(100, 106))]
+    assert moves and any(_dist(tuple(o["to"]), (80, 80)) <= 18 for o in moves)
+
+
+def test_no_pause_at_a_base_someone_has_looked_inside():
+    army = [{"id": 100 + i, "type": "3tnk", "x": 62 + (i % 3), "y": 64 + (i // 3), "idle": False, "hp": 100} for i in range(6)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 80}))
+    b.rules = {"3tnk": {"cost": 1150, "speed": 1.56}, "jeep": {"cost": 500, "speed": 4.0}}
+    scout = [{"id": 200, "type": "jeep", "x": 74, "y": 76, "idle": True, "hp": 100}]
+    b.choose_action(_state(_base_obs(units=scout)), CTX)  # a jeep has looked inside
+    b._sent.clear()
+    orders = _orders(b.choose_action(_state(_base_obs(units=army)), CTX))
+    moves = [o for o in orders if o["cmd"] == "attack_move" and set(o["units"]) & set(range(100, 106))]
+    assert moves and any(_dist(tuple(o["to"]), (80, 80)) <= 18 for o in moves)
+    assert "interior never seen" not in b.status()["main_state"]
