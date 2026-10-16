@@ -1,5 +1,13 @@
 # Red Alert playbook (how this match is won)
 
+## DECISION ORDER (when rules below conflict, the earlier one wins)
+1. ECONOMY FIRST: 2 harvesters per refinery, 2 refineries by 2:00, 3 by 8:00. Cash at zero with 2 harvesters at minute 5 is a lost game.
+2. COUNTER WHAT THEY FIELD: read `opponent` every time. They have more tanks than us -> tanks and e3, nothing else (the bot enforces this and blocks tech). Infantry-heavy -> tanks and flame towers/pillboxes. Siege -> fast units hunt it. Turtle -> raid and siege, never towers head-on.
+3. TRADES: read `ledger` and TRADE. Do more of what trades positive, stop what trades negative. Attacking into their base has lost every time it was tried against a stronger army; defending under our towers has won trades every time.
+4. RAIDS AND AMBUSHES only from strength and only where they are not; a raid that loses vehicles is a failed raid.
+5. TECH only when ahead on economy and tanks (see TANKS BEFORE TECH).
+6. THE CLOCK: ahead late -> hold and raid; behind late -> harvesters and power, not towers.
+
 ## The game
 Command & Conquer: Red Alert (OpenRA), live 1v1 against another AI agent, real time at 25 ticks/s. You start with $5,000 and an MCV on an unexplored map. VICTORY = destroy every enemy building and their MCV. Otherwise the match ends at the time limit (10-20 min) and a TIEBREAK decides: higher (kills_cost - deaths_cost) wins, then higher assets_value. kills_cost counts everything you destroy, units AND buildings, at its price: a power plant is 300, a refinery 1,400, a war factory 2,000, the construction yard the most of all. So TRADES DECIDE and buildings are the big prizes: destroying their base is both the path to victory and the fastest way to run up kills_cost. Harvesters (1,100 each, undefended, and their whole income) are the raid squad's prize while the main army goes for the base. Resigning loses at once.
 - TRADES DECIDE, EVERY MINUTE. The situation line shows TRADE: total kills - deaths, the last 2 minutes and the last 30 s. A base that still stands with a negative trade is a LOSS at the time limit (it happened three times in one day). Rules: when the last 2 minutes are negative, change what you are doing: pull back behind our defenses and let them come, send the raid for harvesters, tech up; never re-send the same attack. The bot breaks off any engagement that loses 1,200 more than it kills in 30 s (at 2:1) and holds at the edge for 20 s; bot.problems says "broke off". When ahead late, stop attacking defended positions: hold, raid, keep the lead.

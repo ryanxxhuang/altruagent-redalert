@@ -1234,3 +1234,35 @@ def test_one_driven_off_raid_marks_the_spot_hot():
     b = bot()
     b._raid_hot = {(74 // 10, 73 // 10): [_t.monotonic()]}
     assert b._raid_hot_now((74, 73)) and b._raid_hot_now((70, 70))
+
+
+def test_opponent_model_and_counter_build():
+    army = [{"id": 100 + i, "type": "e3", "x": 26, "y": 26, "idle": True, "hp": 100} for i in range(4)]
+    foes = [{"id": 900 + i, "type": "2tnk", "x": 60, "y": 60, "hp": 100} for i in range(5)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"vehicle": "harv", "build": "dome", "infantry": "e1"}))
+    b.rules = {"2tnk": {"cost": 850, "speed": 1.76}, "3tnk": {"cost": 1150, "speed": 1.56}, "e3": {"cost": 300, "speed": 1.32}}
+    obs = _base_obs(units=army + [{"id": 51, "type": "harv", "x": 30, "y": 30}, {"id": 52, "type": "harv", "x": 31, "y": 30}],
+                    visible_enemies=foes)
+    orders = _orders(b.choose_action(_state(obs), CTX))
+    om = b.opponent_model()
+    assert om["tanks"] == 5 and om["our_tanks"] == 0 and any("build tanks" in a for a in om["advice"])
+    assert any(o["cmd"] == "train" and o["item"] == "3tnk" for o in orders)   # counter: tanks, not the harvester
+    assert any(o["cmd"] == "train" and o["item"] == "e3" for o in orders)     # and rockets, not riflemen
+    assert {"cmd": "build", "item": "dome"} not in orders                      # no tech while out-tanked
+    assert "OPPONENT now: 5 tanks" in b._situation()
+
+
+def test_ledger_splits_trades_by_attacking_and_holding():
+    army = [{"id": 100 + i, "type": "3tnk", "x": 50, "y": 50, "idle": True, "hp": 100} for i in range(6)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "hold"}))
+    obs = _base_obs(units=army); obs["military"] = {"kills_cost": 0, "deaths_cost": 0}
+    b.choose_action(_state(obs), CTX)
+    obs["military"] = {"kills_cost": 1000, "deaths_cost": 200}
+    b._sent.clear(); b.choose_action(_state(obs), CTX)        # +800 while holding
+    b.advisor = FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 50})
+    b._sent.clear(); b.choose_action(_state(obs), CTX)        # attack starts
+    obs["military"] = {"kills_cost": 1200, "deaths_cost": 2200}
+    b._sent.clear(); b.choose_action(_state(obs), CTX)        # -1800 while attacking
+    led = b.status()["ledger"]
+    assert led["holding"] == {"killed": 1000, "lost": 200} and led["attacking"] == {"killed": 200, "lost": 2000}
+    assert "LEDGER attacking: killed 200 lost 2000 (1 attacks)" in b._situation()

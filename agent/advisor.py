@@ -343,13 +343,17 @@ class Commanders:
         summary["bot_status"] = bot_status or {}
         strategy = self._layers.get("strategy")
         if strategy and strategy.due():
-            strategy.run({"previous_plans": self._plans[-3:], "match": summary}, self._on_strategy)
+            strategy.run({"previous_plans": self._plans[-3:], "situation": (bot_status or {}).get("situation"),
+                          "opponent": (bot_status or {}).get("opponent"), "ledger": (bot_status or {}).get("ledger"),
+                          "match": {k: v for k, v in summary.items() if k != "bot_status"}}, self._on_strategy)
         tactical = self._layers.get("tactical")
         if tactical and tactical.due():
             obs = raw.get("observation") or {}
             asked = time.monotonic()
             tactical.run(
                 {"situation": (bot_status or {}).get("situation"),
+                 "opponent": (bot_status or {}).get("opponent"),
+                 "ledger": (bot_status or {}).get("ledger"),
                  "your_recent_decisions": [
                      {k: v for k, v in dd.items() if k in ("main_action", "main_x", "main_y", "raid_size", "build", "vehicle")}
                      for dd in list(self._recent_decisions)[-3:]],

@@ -107,6 +107,12 @@ RAID_HOT_S = 120.0          # a target the squad was driven off is avoided this 
 RAID_HOT_CELL = 10          # ... as a block this many cells across
 RAID_BUILDING_PRIORITY = {"powr": 0, "apwr": 0, "proc": 1, "silo": 2, "weap": 3, "barr": 3, "tent": 3, "dome": 4,
                           "fix": 4, "stek": 5, "atek": 5}
+# Opponent model: what we have seen of them, and the production that counters it.
+TANK_TYPES = frozenset({"1tnk", "2tnk", "3tnk", "4tnk", "ttnk", "ctnk", "stnk", "qtnk"})
+SIEGE_TYPES = frozenset({"v2rl", "arty"})
+ANTI_TANK_INF = "e3"
+OPP_RECENT_S = 120.0        # "their current army" is what we have seen this recently
+TECH_BUILDINGS = ("weap", "fix", "dome", "stek", "atek", "proc")
 # Ambush: the raid baits their army into a pocket between our two groups.
 AMBUSH_JAW_A = 8            # the heavy group waits this far behind the pocket (towards home)
 AMBUSH_JAW_B = 12           # the fast group waits this far to the quieter side of the pocket
@@ -297,6 +303,11 @@ class RedAlertBot:
         self._trade_hist: deque = deque(maxlen=600)   # (game_s, kills_cost, deaths_cost)
         self._trade_broken_until = 0.0
         self._trade_breaks: list[float] = []      # when attacks were broken off or crushed (last 5 min)
+        self._opp_seen: dict[int, tuple[str, float]] = {}   # enemy unit id -> (type, last seen)
+        self._opp_tags: dict[str, bool] = {}                  # rushed / raids_our_ore / turtle / chases
+        self._ledger = {"attacking": [0.0, 0.0], "holding": [0.0, 0.0]}  # [kills, deaths] by what we were doing
+        self._ledger_last: tuple[float, float] | None = None
+        self._attacks_started = 0
         self._no_queued = False                  # the server refused queued orders
         self._enemy_ore: tuple[int, int] | None = None
         self._enemy_harv_seen: dict[int, tuple[tuple[int, int], float]] = {}
@@ -413,6 +424,8 @@ class RedAlertBot:
             "our_army_strength": round(getattr(self, "_our_strength", 0)),
             "main_state": self._main_state,
             "situation": self._situation(),
+            "opponent": self.opponent_model(),
+            "ledger": {k: {"killed": round(v[0]), "lost": round(v[1])} for k, v in self._ledger.items()},
             "threat_near_base_strength": round(self._threat),
             "enemy_ore_field": list(self._enemy_ore) if self._enemy_ore else None,
             "raid_squad": len(self._raiders),
@@ -557,6 +570,15 @@ class RedAlertBot:
         tech = f"; tech: {', '.join(done) or 'nothing yet'}; next: {nxt}"
         raiding = f" (raid squad out: tech window)" if self._raid_info.get("phase") in ("approach", "strike") else ""
         group += tech + raiding + self._trade_line()
+        om = self.opponent_model()
+        group += (f"; OPPONENT now: {om['tanks']} tanks, {om['infantry']} infantry, {om['siege']} siege, "
+                  f"{om['defenses']} defenses, tech {','.join(om['tech_seen']) or '?'}"
+                  + (f", habits {','.join(om['habits'])}" if om["habits"] else "")
+                  + (f". {' | '.join(om['advice'])}" if om["advice"] else ""))
+        led = self._ledger
+        group += (f"; LEDGER attacking: killed {led['attacking'][0]:.0f} lost {led['attacking'][1]:.0f} "
+                  f"({self._attacks_started} attacks); holding/defending: killed {led['holding'][0]:.0f} "
+                  f"lost {led['holding'][1]:.0f}")
         if time.monotonic() < self._trade_broken_until:
             group += "; BROKE OFF a losing trade: holding at the edge for a moment"
         return (f"our army {ours:.0f} vs their known army {total:.0f} ({ratio}); at our base {self._threat:.0f}; "
@@ -644,7 +666,13 @@ class RedAlertBot:
         game_s = (raw.get("time") or {}).get("game_seconds")
         self._game_s = float(game_s) if isinstance(game_s, (int, float)) else self._game_s
         mil = obs.get("military") or {}
-        self._trade_hist.append((self._game_s, float(mil.get("kills_cost") or 0), float(mil.get("deaths_cost") or 0)))
+        k_now, d_now = float(mil.get("kills_cost") or 0), float(mil.get("deaths_cost") or 0)
+        self._trade_hist.append((self._game_s, k_now, d_now))
+        if self._ledger_last is not None:
+            bucket = self._ledger["attacking" if self._attacking else "holding"]
+            bucket[0] += k_now - self._ledger_last[0]
+            bucket[1] += d_now - self._ledger_last[1]
+        self._ledger_last = (k_now, d_now)
         if self._rush_active and self._game_s > RUSH_UNTIL_S:
             self._rush_active = False
         self._visible_enemy_buildings = enemy_buildings
@@ -657,11 +685,13 @@ class RedAlertBot:
         self._remember_enemy_buildings(enemy_buildings, units, buildings)
         self._remember_enemy_harvesters(enemies)
         self._track_enemies(enemies, units)
+        self._tag_opponent(enemies, units)
 
         orders: list[dict] = []
         notes: list[str] = []
         btypes = Counter(str(b.get("type", "")).lower() for b in buildings)
         self._btypes = btypes
+        self._our_types = Counter(str(u.get("type", "")).lower() for u in units)
         has_yard = btypes["fact"] > 0
 
         # 1. Deploy the MCV (also a rebuilt or second one, if we have no yard).
@@ -814,6 +844,12 @@ class RedAlertBot:
             self._problem(f"{key} {want}: just refused by the server")
             return None
         drain = self._power(want)
+        if want in ("dome", "stek", "atek"):
+            om = self.opponent_model()
+            if om["tanks"] > om["our_tanks"]:
+                self._consumed.discard((d["seq"], key))
+                self._problem(f"{want} not built: they have {om['tanks']} tanks vs our {om['our_tanks']}; tanks first")
+                return self._general_next(available, queued) if key == "build" else None
         if want in POWER and power_margin >= POWER_SURPLUS_REFUSE:
             self._consumed.discard((d["seq"], key))  # still pending, should power drop
             self._problem(f"{want} not built: power margin is already +{power_margin}")
@@ -928,6 +964,29 @@ class RedAlertBot:
                     self._raid_built += 1
                     busy = busy | {"Vehicle"}
                     notes.append(f"training {item} for the raid squad ({self._raid_built}/{RAID_BUILD_CAP})")
+        # Counter their composition: more tanks than ours -> tanks and rockets,
+        # whatever else was asked (harvesters still come first).
+        om = self.opponent_model()
+        counter_tanks = om["tanks"] > om["our_tanks"] and have["weap"] > 0
+        if d and counter_tanks:
+            can = lambda item: item in available and not self._blocked_now(item)  # noqa: E731
+            tank = next((t for t in ("3tnk", "2tnk", "1tnk") if can(t)), None)
+            need_harv = len(harvesters) + queued["harv"] < min(2 * max(have["proc"], 1), 3)
+            if tank and "Vehicle" not in busy and not need_harv and not self._recent("vehicle", 0.8):
+                orders.append({"cmd": "train", "item": tank, "count": 1})
+                self._mark("vehicle")
+                busy = busy | {"Vehicle"}
+                handled.add("Vehicle")
+                notes.append(f"counter: {tank} ({om['tanks']} enemy tanks vs our {om['our_tanks']})")
+            if can(ANTI_TANK_INF) and "Infantry" not in busy and not self._recent("infantry", 0.8) and d.get("infantry") != "":
+                orders.append({"cmd": "train", "item": ANTI_TANK_INF, "count": 2})
+                self._mark("infantry")
+                busy = busy | {"Infantry"}
+                handled.add("Infantry")
+            if not self._recent("counter_note", 30.0):
+                self._mark("counter_note")
+                self._problem(f"counter-building: {om['tanks']} enemy tanks vs our {om['our_tanks']}; vehicle queue "
+                              f"makes tanks and infantry queue e3 until matched")
         if d:
             for queue, key in (("Vehicle", "vehicle"), ("Infantry", "infantry")):
                 want = d.get(key, "auto")
@@ -1237,6 +1296,7 @@ class RedAlertBot:
             if isinstance(e.get("id"), int) and _xy(e):
                 self._enemy_hist.setdefault(e["id"], deque(maxlen=10)).append((now, _xy(e)))
                 visible.add(e["id"])
+                self._opp_seen[e["id"]] = (str(e.get("type", "")).lower(), now)
                 if self._is_combat(e):
                     self._enemy_army[e["id"]] = {"type": e.get("type"), "hp": e.get("hp"), "x": e["x"], "y": e["y"], "t": now}
                     self._enemy_army_seen_at = now
@@ -1250,6 +1310,53 @@ class RedAlertBot:
         if len(self._enemy_hist) > 300:
             for eid in [i for i, h in self._enemy_hist.items() if now - h[-1][0] > 10]:
                 del self._enemy_hist[eid]
+
+    def _tag_opponent(self, enemies: list[dict], units: list[dict]) -> None:
+        base = getattr(self, "_base_cell", None)
+        if base:
+            combat_near = [e for e in enemies if _xy(e) and self._is_combat(e) and _dist(_xy(e), base) <= 25]
+            if combat_near and self._game_s < 180:
+                self._opp_tags["rushed"] = True
+            harvs = [u for u in units if str(u.get("type", "")).lower() == "harv" and _xy(u)]
+            if any(_xy(e) and self._is_combat(e) and any(_dist(_xy(e), _xy(h)) <= 6 for h in harvs) for e in enemies):
+                self._opp_tags["raids_our_ore"] = True
+        if len(self.enemy_defenses()) >= 2 and self._game_s >= 360 and not self._opp_tags.get("rushed"):
+            self._opp_tags["turtle"] = True
+        r = self._raid_info or {}
+        if r.get("responders") and (r.get("responders_from_their_base") or 0) >= 20:
+            self._opp_tags["chases"] = True
+
+    def opponent_model(self) -> dict:
+        """What we know of them: composition seen lately, tech, defenses, habits,
+        and the composition gap that decides what we should be building."""
+        now = time.monotonic()
+        recent = Counter(t for t, seen in self._opp_seen.values() if now - seen <= OPP_RECENT_S and t)
+        ever = Counter(t for t, _ in self._opp_seen.values() if t)
+        their_tanks = sum(n for t, n in recent.items() if t in TANK_TYPES)
+        their_siege = sum(n for t, n in recent.items() if t in SIEGE_TYPES)
+        their_inf = sum(n for t, n in recent.items() if t in ("e1", "e2", "e3", "e4", "shok", "e7"))
+        tech = sorted({str(b.get("type", "")).lower() for b in self._enemy_buildings.values()
+                       if str(b.get("type", "")).lower() in TECH_BUILDINGS})
+        our = getattr(self, "_our_types", Counter())
+        our_tanks = sum(n for t, n in our.items() if t in TANK_TYPES)
+        our_e3 = our.get(ANTI_TANK_INF, 0)
+        advice = []
+        if their_tanks > our_tanks:
+            advice.append(f"they have {their_tanks} tanks, we have {our_tanks}: build tanks and {ANTI_TANK_INF} now, no tech until matched")
+        if their_siege and not any(t in SIEGE_TYPES for t in our):
+            advice.append("they have siege units: fast units (jeep/ftrk/1tnk) must hunt them; don't sit in a turret")
+        if their_inf >= 8 and their_tanks == 0:
+            advice.append("infantry-heavy: tanks crush them; flame towers / pillboxes trade well")
+        if self._opp_tags.get("turtle"):
+            advice.append("turtling: don't attack the towers, raid the ore and bring siege")
+        return {
+            "recent_units": dict(recent), "ever_seen_units": dict(ever),
+            "tanks": their_tanks, "siege": their_siege, "infantry": their_inf,
+            "tech_seen": tech, "defenses": len(self.enemy_defenses()),
+            "habits": sorted(k for k, v in self._opp_tags.items() if v),
+            "our_tanks": our_tanks, "our_e3": our_e3,
+            "advice": advice,
+        }
 
     def enemy_largest_group(self) -> tuple[float, tuple[int, int] | None, float]:
         """(strength, cell, seconds ago) of the biggest cluster of enemy combat
@@ -1637,6 +1744,7 @@ class RedAlertBot:
             if not self._attacking:
                 self._attacking = True
                 self._wave += 1
+                self._attacks_started += 1
                 self.log(f"[bot] commander attack #{self._wave} with {len(force)} units on {target}")
             ours_s, theirs_s = self._local_strength(force, enemies)
             if force and theirs_s > 0 and ours_s < CRUSHED * theirs_s:
