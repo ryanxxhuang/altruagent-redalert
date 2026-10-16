@@ -173,11 +173,9 @@ def test_layer_settings_and_handlers(monkeypatch):
         monkeypatch.delenv(var, raising=False)
     c = advisor.commanders_from_env(log=lambda m: None)
     layers = c._layers
-    assert (layers["strategy"].model, layers["strategy"].effort) == ("claude-opus-5-5", "medium")
-    assert (layers["tactical"].model, layers["tactical"].effort, layers["tactical"].every) == ("claude-sonnet-5-5", "low", 3.0)
-    assert (layers["fast"].model, layers["fast"].effort) == ("claude-haiku-5-5", "low")
-    fast = layers["fast"]._request_kwargs()
-    assert fast["thinking"] == {"type": "disabled"} and "fallbacks" not in fast  # Haiku: no server fallback
+    assert (layers["strategy"].model, layers["strategy"].effort) == ("claude-fable-5-1", "high")
+    assert (layers["tactical"].model, layers["tactical"].effort, layers["tactical"].every) == ("claude-opus-5-5", "low", 6.0)
+    assert "fast" not in layers  # micro is the bot's own reflexes
     assert "thinking" not in layers["tactical"]._request_kwargs()
     assert layers["strategy"]._request_kwargs()["fallbacks"] == "default"
     c._on_strategy({"posture": "aggressive", "unit_focus": "tanks", "defenses": 9, "max_refineries": 2,
@@ -568,7 +566,7 @@ def test_strategy_hint_per_seat_reaches_general_and_commander(monkeypatch):
     b = advisor.commanders_from_env(log=lambda m: None, seat=1)
     assert "rush with infantry" in a._layers["strategy"].system and "rush with infantry" in a._layers["tactical"].system
     assert "macro into tanks" in b._layers["strategy"].system and "macro" not in a._layers["strategy"].system.split("Operator")[1]
-    assert "Operator instruction" not in b._layers["fast"].system
+    assert "Operator instruction" in b._layers["tactical"].system
 
 
 def test_enemy_units_are_fought_before_buildings_by_everyone_in_reach():
@@ -862,7 +860,8 @@ def test_focus_fire_stays_on_one_target_until_it_dies():
     assert all(o["target"] == first for o in orders if o["cmd"] == "attack" and set(o["units"]) & {100, 101, 102})
 
 
-def test_pincer_flanks_round_the_back_then_closes():
+def test_pincer_flanks_round_the_back_then_closes(monkeypatch):
+    monkeypatch.setattr(__import__('agent.redalert_bot', fromlist=['x']), 'LLM_AUTHORITY', False)
     from agent import redalert_bot as rb
     army = [{"id": 100 + i, "type": "3tnk", "x": 30, "y": 50, "idle": True, "hp": 100} for i in range(5)]
     army += [{"id": 200 + i, "type": "1tnk", "x": 30, "y": 50, "idle": True, "hp": 100} for i in range(3)]
@@ -1041,7 +1040,8 @@ def test_in_contact_the_army_holds_unless_it_has_the_edge():
     assert "holding at the edge" in b.status()["main_state"] or "holding ground" in b.status()["main_state"]
 
 
-def test_pincer_does_not_restart_when_the_auto_target_drifts():
+def test_pincer_does_not_restart_when_the_auto_target_drifts(monkeypatch):
+    monkeypatch.setattr(__import__('agent.redalert_bot', fromlist=['x']), 'LLM_AUTHORITY', False)
     army = [{"id": 100 + i, "type": "3tnk", "x": 30, "y": 50, "idle": True, "hp": 100} for i in range(5)]
     army += [{"id": 200 + i, "type": "1tnk", "x": 30, "y": 50, "idle": True, "hp": 100} for i in range(3)]
     army += [{"id": 300 + i, "type": "jeep", "x": 27, "y": 27, "idle": True, "hp": 100} for i in range(2)]
@@ -1086,7 +1086,8 @@ def test_raid_leaves_at_the_first_responder_and_on_any_damage():
     assert b2._raid_phase == "withdraw"  # 6% damage: go
 
 
-def test_raids_pause_after_losing_two_vehicles_and_replacements_are_capped():
+def test_raids_pause_after_losing_two_vehicles_and_replacements_are_capped(monkeypatch):
+    monkeypatch.setattr(__import__('agent.redalert_bot', fromlist=['x']), 'LLM_AUTHORITY', False)
     from agent import redalert_bot as rb
     squad = [{"id": 100 + i, "type": "jeep", "x": 60, "y": 60, "idle": True, "hp": 100} for i in range(3)]
     b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 3, "raid_x": 80, "raid_y": 60}))
@@ -1194,7 +1195,8 @@ def test_raid_picks_the_side_away_from_their_army_and_undefended_buildings():
     assert b._raid_cell((80, 80)) == (95, 90)
 
 
-def test_repeated_failed_attacks_cool_off_longer_each_time():
+def test_repeated_failed_attacks_cool_off_longer_each_time(monkeypatch):
+    monkeypatch.setattr(__import__('agent.redalert_bot', fromlist=['x']), 'LLM_AUTHORITY', False)
     from agent import redalert_bot as rb
     b = bot()
     b._break_off("test")
@@ -1207,7 +1209,8 @@ def test_repeated_failed_attacks_cool_off_longer_each_time():
     assert b._trade_broken_until - __import__("time").monotonic() <= rb.TRADE_COOLDOWN_MAX_S + 1
 
 
-def test_ambush_is_refused_when_we_are_weaker():
+def test_ambush_is_refused_when_we_are_weaker(monkeypatch):
+    monkeypatch.setattr(__import__('agent.redalert_bot', fromlist=['x']), 'LLM_AUTHORITY', False)
     import time as _t
     army = [{"id": 100 + i, "type": "3tnk", "x": 40, "y": 50, "idle": True, "hp": 100} for i in range(6)]  # 6,900
     b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "ambush"}))
@@ -1215,7 +1218,7 @@ def test_ambush_is_refused_when_we_are_weaker():
     b._enemy_army = {900 + i: {"type": "2tnk", "hp": 100, "x": 80, "y": 50, "t": _t.monotonic()} for i in range(8)}  # 6,800
     b._enemy_army_seen_at = _t.monotonic()
     b.choose_action(_state(_base_obs(units=army)), CTX)
-    assert b._ambush is None and any("ambush refused" in p for p in b.status()["problems"])
+    assert b._ambush is None and any("ambush warning" in p for p in b.status()["problems"])
 
 
 def test_raid_vehicles_wait_for_the_economy():
@@ -1236,7 +1239,8 @@ def test_one_driven_off_raid_marks_the_spot_hot():
     assert b._raid_hot_now((74, 73)) and b._raid_hot_now((70, 70))
 
 
-def test_opponent_model_and_counter_build():
+def test_opponent_model_and_counter_build(monkeypatch):
+    monkeypatch.setattr(__import__('agent.redalert_bot', fromlist=['x']), 'LLM_AUTHORITY', False)
     army = [{"id": 100 + i, "type": "e3", "x": 26, "y": 26, "idle": True, "hp": 100} for i in range(4)]
     foes = [{"id": 900 + i, "type": "2tnk", "x": 60, "y": 60, "hp": 100} for i in range(5)]
     b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"vehicle": "harv", "build": "dome", "infantry": "e1"}))
@@ -1266,3 +1270,23 @@ def test_ledger_splits_trades_by_attacking_and_holding():
     led = b.status()["ledger"]
     assert led["holding"] == {"killed": 1000, "lost": 200} and led["attacking"] == {"killed": 200, "lost": 2000}
     assert "LEDGER attacking: killed 200 lost 2000 (1 attacks)" in b._situation()
+
+
+def test_under_llm_authority_the_guards_only_advise(monkeypatch):
+    import time as _t
+    from agent import redalert_bot as rb
+    monkeypatch.setattr(rb, "LLM_AUTHORITY", True)
+    # Raid floor off: the commander's raid_size 0 stands even with fast vehicles idle.
+    units = [{"id": 100 + i, "type": "jeep", "x": 26, "y": 26, "idle": True, "hp": 100} for i in range(3)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 0}))
+    b.rules = {"jeep": {"cost": 500, "speed": 4.0}, "2tnk": {"cost": 850, "speed": 1.76}, "3tnk": {"cost": 1150, "speed": 1.56}}
+    b.choose_action(_state(_base_obs(units=units)), CTX)
+    assert not b._raiders
+    # Counter-build and tech block advise instead of overriding.
+    foes = [{"id": 900 + i, "type": "2tnk", "x": 60, "y": 60, "hp": 100} for i in range(5)]
+    b2 = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"vehicle": "harv", "build": "dome"}))
+    b2.rules = b.rules
+    obs = _base_obs(units=[{"id": 51, "type": "harv", "x": 30, "y": 30}, {"id": 52, "type": "harv", "x": 31, "y": 30}], visible_enemies=foes)
+    orders = _orders(b2.choose_action(_state(obs), CTX))
+    assert {"cmd": "build", "item": "dome"} in orders and any(o["cmd"] == "train" and o["item"] == "harv" for o in orders)
+    assert any("build tanks" in a for a in b2.opponent_model()["advice"])

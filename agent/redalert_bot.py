@@ -107,6 +107,9 @@ RAID_HOT_S = 120.0          # a target the squad was driven off is avoided this 
 RAID_HOT_CELL = 10          # ... as a block this many cells across
 RAID_BUILDING_PRIORITY = {"powr": 0, "apwr": 0, "proc": 1, "silo": 2, "weap": 3, "barr": 3, "tent": 3, "dome": 4,
                           "fix": 4, "stek": 5, "atek": 5}
+# LLM authority: the LLM commands; the bot's own strategic guards (raid floor,
+# counter-build, tech block, ambush refusal, escalating cool-off) only advise.
+LLM_AUTHORITY = os.environ.get("LLM_AUTHORITY", "1") not in ("0", "false", "no")
 # Opponent model: what we have seen of them, and the production that counters it.
 TANK_TYPES = frozenset({"1tnk", "2tnk", "3tnk", "4tnk", "ttnk", "ctnk", "stnk", "qtnk"})
 SIEGE_TYPES = frozenset({"v2rl", "arty"})
@@ -495,7 +498,7 @@ class RedAlertBot:
         keeps happening (an army that is crushed every minute must stop)."""
         now = time.monotonic()
         self._trade_breaks = [t for t in self._trade_breaks if now - t < 300] + [now]
-        cool = min(TRADE_COOLDOWN_S * (2 ** (len(self._trade_breaks) - 1)), TRADE_COOLDOWN_MAX_S)
+        cool = TRADE_COOLDOWN_S if LLM_AUTHORITY else min(TRADE_COOLDOWN_S * (2 ** (len(self._trade_breaks) - 1)), TRADE_COOLDOWN_MAX_S)
         self._trade_broken_until = now + cool
         self._attacking = False
         self._pincer = None
@@ -844,7 +847,7 @@ class RedAlertBot:
             self._problem(f"{key} {want}: just refused by the server")
             return None
         drain = self._power(want)
-        if want in ("dome", "stek", "atek"):
+        if want in ("dome", "stek", "atek") and not LLM_AUTHORITY:
             om = self.opponent_model()
             if om["tanks"] > om["our_tanks"]:
                 self._consumed.discard((d["seq"], key))
@@ -953,7 +956,7 @@ class RedAlertBot:
             else:
                 fast_owned = sum(1 for u in army if self._speed(u) >= RAID_FAST) + sum(
                     queued[v] for v in RAID_VEHICLES)
-            paused = time.monotonic() < self._raid_paused_until
+            paused = time.monotonic() < self._raid_paused_until and not LLM_AUTHORITY
             if fast_owned < (1 if apc_mode else d["raid_size"]) and self._raid_built < RAID_BUILD_CAP and not paused:
                 want = str(d.get("raid_unit") or "").lower()
                 options = ([want] if want in RAID_VEHICLES else []) + list(RAID_VEHICLES)
@@ -967,7 +970,7 @@ class RedAlertBot:
         # Counter their composition: more tanks than ours -> tanks and rockets,
         # whatever else was asked (harvesters still come first).
         om = self.opponent_model()
-        counter_tanks = om["tanks"] > om["our_tanks"] and have["weap"] > 0
+        counter_tanks = om["tanks"] > om["our_tanks"] and have["weap"] > 0 and not LLM_AUTHORITY
         if d and counter_tanks:
             can = lambda item: item in available and not self._blocked_now(item)  # noqa: E731
             tank = next((t for t in ("3tnk", "2tnk", "1tnk") if can(t)), None)
@@ -1635,13 +1638,13 @@ class RedAlertBot:
         standing = int(self.knobs.get("standing_raid", 0) or 0)
         fast_free = sum(1 for i, u in alive.items() if self._speed(u) >= RAID_FAST and i not in self._apc_ids())
         floor = min(RAID_FLOOR, fast_free) if fast_free >= RAID_FLOOR else 0
-        if time.monotonic() < self._raid_paused_until:
+        if time.monotonic() < self._raid_paused_until and not LLM_AUTHORITY:
             size = 0  # too many raiders lost lately: everyone stays home for a while
         elif not apc_mode and self._threat <= 0 and rtarget is not None:
             if standing > size and len(alive) >= standing + 4:
-                size = standing
-            if floor > size and d["raid_size"] <= 0:
-                size = floor  # fast vehicles never sit at home: raids run all game
+                size = standing  # the general's standing raid is an LLM decision
+            if floor > size and d["raid_size"] <= 0 and not LLM_AUTHORITY:
+                size = floor
         if size <= 0 and self._raiders:
             if staging:
                 orders.append({"cmd": "move", "units": sorted(self._raiders)[:max_units], "to": list(staging)})
@@ -1925,11 +1928,12 @@ class RedAlertBot:
                 return []
             ours_total = sum(self._strength(u) for u in alive.values())
             if big >= DOCTRINE_MIN and age <= 60 and ours_total < AHEAD_EDGE * big or len(alive) < 6:
-                self._problem(f"ambush refused: our {ours_total:.0f} vs their group {big:.0f} (need 1.3x and 6+ units); "
-                              f"splitting a weaker army loses it. Defend, raid, build tanks")
-                self._main_state = "ambush refused: too weak to split"
-                notes.append(self._main_state)
-                return []
+                self._problem(f"ambush warning: our {ours_total:.0f} vs their group {big:.0f} (1.3x and 6+ units advised); "
+                              f"splitting a weaker army can lose it")
+                if not LLM_AUTHORITY:
+                    self._main_state = "ambush refused: too weak to split"
+                    notes.append(self._main_state)
+                    return []
             their = big_cell or getattr(self, "_enemy_base_cache", None)
             if not their:
                 self._problem("ambush: no enemy group or base known to bait; scout first")

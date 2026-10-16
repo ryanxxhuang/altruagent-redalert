@@ -174,9 +174,9 @@ JSON only."""
 
 LAYERS = {
     # name: (model env, default model, effort env, default effort, every seconds, timeout seconds, max calls)
-    "strategy": ("STRATEGY_MODEL", "claude-opus-5-5", "STRATEGY_EFFORT", "medium", 15.0, 90.0, 120),
-    "tactical": ("TACTICAL_MODEL", "claude-sonnet-5-5", "TACTICAL_EFFORT", "low", 3.0, 30.0, 500),
-    "fast": ("FAST_MODEL", "claude-haiku-5-5", "FAST_EFFORT", "low", 4.0, 15.0, 400),
+    "strategy": ("STRATEGY_MODEL", "claude-fable-5-1", "STRATEGY_EFFORT", "high", 20.0, 120.0, 120),
+    "tactical": ("TACTICAL_MODEL", "claude-opus-5-5", "TACTICAL_EFFORT", "low", 6.0, 40.0, 500),
+    "fast": ("FAST_MODEL", "off", "FAST_EFFORT", "low", 4.0, 15.0, 400),
 }
 FIGHT_RADIUS = 14  # the fast layer only runs while enemies are this close to our army
 # USD per million tokens (input, output), for the live cost report.
