@@ -266,6 +266,7 @@ class RedAlertBot:
         self._raid_info: dict = {}               # what the squad is doing, for the commander
         self._raid_hp_start = 0.0                # squad hp when the strike began
         self._raid_last_chased = 0.0             # when an enemy last came closer to the squad
+        self._raid_hot: dict[tuple[int, int], list[float]] = {}  # target -> times the squad was driven off there
         self._no_queued = False                  # the server refused queued orders
         self._enemy_ore: tuple[int, int] | None = None
         self._enemy_harv_seen: dict[int, tuple[tuple[int, int], float]] = {}
@@ -448,7 +449,11 @@ class RedAlertBot:
     def _situation(self) -> str:
         ours = getattr(self, "_our_strength", 0)
         theirs, known = self.enemy_army_estimate()
-        ratio = f"{ours / theirs:.1f}x" if theirs else ("no enemy army seen" if not known else "their army is gone")
+        defs_s = sum(self._strength(b) for b in self.enemy_defenses() if self._defense_reach(b) > 0)
+        total = theirs + defs_s
+        ratio = f"{ours / total:.1f}x" if total else ("no enemy army seen" if not known else "their army is gone")
+        if defs_s:
+            ratio += f", their units {theirs:.0f} + defenses {defs_s:.0f} = {total:.0f}"
         held = f", main army idle {self._game_s - self._holding_since:.0f}s" if self._holding_since is not None else ""
         big, cell, age = self.enemy_largest_group()
         group = ""
@@ -475,7 +480,7 @@ class RedAlertBot:
             r = self._raid_info
             group += (f"; raid squad ({r.get('size')}): {r.get('phase')} at {r.get('at')}, responders {r.get('responders')}"
                       + (f" ({r.get('responders_from_their_base')} cells from their base)" if r.get("responders") else ""))
-        return (f"our army {ours:.0f} vs their known army {theirs:.0f} ({ratio}); at our base {self._threat:.0f}; "
+        return (f"our army {ours:.0f} vs their known army {total:.0f} ({ratio}); at our base {self._threat:.0f}; "
                 f"main army: {self._main_state}{held}; ahead of it {getattr(self, '_ahead', 0):.0f}{group}")
 
     def _llm(self) -> dict | None:
@@ -1429,7 +1434,7 @@ class RedAlertBot:
         standing = int(self.knobs.get("standing_raid", 0) or 0)
         fast_free = sum(1 for i, u in alive.items() if self._speed(u) >= RAID_FAST and i not in self._apc_ids())
         floor = min(RAID_FLOOR, fast_free) if fast_free >= RAID_FLOOR else 0
-        if not apc_mode and self._threat <= 0:
+        if not apc_mode and self._threat <= 0 and rtarget is not None:
             if standing > size and len(alive) >= standing + 4:
                 size = standing
             if floor > size and d["raid_size"] <= 0:
@@ -1558,7 +1563,8 @@ class RedAlertBot:
             big, big_cell, _ = self.enemy_largest_group()
             target = cell(d["main_x"], d["main_y"], None) or big_cell or self._attack_target(enemies, force, enemy_base)
             if target and force and not self._recent("attack", 2.0):
-                orders += self._pincer_step(raw, force, enemies, tuple(target), staging, notes)
+                orders += self._pincer_step(raw, force, enemies, tuple(target), staging, notes,
+                                            d_main=cell(d["main_x"], d["main_y"], None))
                 self._mark("attack")
             self._attacking = True
         elif action == "hold":
@@ -1673,16 +1679,21 @@ class RedAlertBot:
         return orders
 
     def _pincer_step(self, raw: dict, force: list[dict], enemies: list[dict], target, staging,
-                     notes: list[str]) -> list[dict]:
+                     notes: list[str], d_main=None) -> list[dict]:
         """Front and back: the fastest units circle round to the far side of
         the target while the rest close to PINCER_HOLD cells in front and wait;
         when the flank is in place (or after PINCER_MAX_WAIT_S) both hit at once."""
         now = time.monotonic()
         alive = {u["id"]: u for u in force if _xy(u)}
         p = self._pincer
-        if p is not None and 0 < _dist(p["target"], target) <= PINCER_RETARGET and p["phase"] == "flanking":
-            p["target"] = tuple(target)  # the group shifted a little: same plan, updated target
-        if p is None or _dist(p["target"], target) > PINCER_RETARGET or not (set(p["flank"]) & set(alive)):
+        explicit = d_main is not None
+        if p is not None and p["phase"] != "done":
+            if not explicit or _dist(p["ordered"], d_main) <= PINCER_RETARGET:
+                p["target"] = tuple(target)  # the group drifts: same plan, updated target
+            if not (set(p["flank"]) & set(alive)) and p["phase"] == "flanking":
+                p["phase"] = "closing"  # the flank is gone: finish as one group, don't start over
+                self.log("[bot] pincer: flank lost, closing as one group")
+        if p is None or p["phase"] == "done" or (explicit and _dist(p["ordered"], d_main) > PINCER_RETARGET):
             total = sum(self._strength(u) for u in alive.values()) or 1.0
             flank, s = [], 0.0
             for u in sorted(alive.values(), key=self._speed, reverse=True):
@@ -1713,7 +1724,8 @@ class RedAlertBot:
                 options[side] = (danger, wp)
             side = min(options, key=lambda k: options[k][0])
             hold = self._clamp((int(round(target[0] - ux * PINCER_HOLD)), int(round(target[1] - uy * PINCER_HOLD))), raw)
-            p = self._pincer = {"target": tuple(target), "flank": flank, "side_wp": options[side][1],
+            p = self._pincer = {"target": tuple(target), "ordered": tuple(d_main) if d_main else tuple(target),
+                                "flank": flank, "side_wp": options[side][1],
                                 "behind": behind, "hold": hold, "phase": "flanking", "since": now, "leg": 0}
             self.log(f"[bot] pincer on {list(target)}: {len(flank)} flank via {list(options[side][1])} to "
                      f"{list(behind)}, {len(front_ids)} hold at {list(hold)}")
@@ -1743,6 +1755,11 @@ class RedAlertBot:
             for chunk in _chunks(ids, 50):
                 orders.append({"cmd": "attack_move", "units": chunk, "to": list(p["target"])})
             why = f"pincer closing: front and back on {list(p['target'])}"
+            all_c = self._centroid([_xy(u) for u in flank + front])
+            if all_c and _dist(all_c, p["target"]) <= 4 and not any(
+                    _xy(e) and self._is_combat(e) and _dist(_xy(e), p["target"]) <= 8 for e in enemies):
+                p["phase"] = "done"
+                why = f"pincer done at {list(p['target'])}"
         self._main_state = why
         notes.append(why)
         return orders
@@ -1815,8 +1832,14 @@ class RedAlertBot:
             _dist(_xy(b), core) <= STRUCTURE_FOCUS_RANGE for b in getattr(self, "_visible_enemy_buildings", []) if _xy(b))
         at_home = staging is not None and _dist(core, staging) <= 12
         grouped = s_core >= COHESION_SHARE * s_reach
-        if contact:
+        if contact and (s_core >= AHEAD_EDGE * ahead or ahead < DOCTRINE_MIN):
             dest, why = nxt, f"in contact, pressing on ({s_core:.0f} vs {ahead:.0f} ahead)"
+            self._held_since = None
+        elif contact:
+            # In the fight but not strong enough to push on: hold at the edge of
+            # their reach and shoot what comes; the doctrine backs off if they come on.
+            dest = self._out_of_reach(core, raw)
+            why = f"in contact but outnumbered ahead ({s_core:.0f} vs {ahead:.0f}): holding at the edge, not pushing in"
             self._held_since = None
         elif at_home or grouped:
             if s_core >= AHEAD_EDGE * ahead or (obey and ahead < DOCTRINE_MIN):
@@ -1980,6 +2003,14 @@ class RedAlertBot:
             unopposed = responders == 0 and prey and now < self._raid_strike_until - RAID_STRIKE_S + RAID_STRIKE_MAX_S
             if threatened or hurt or (now >= self._raid_strike_until and not unopposed):
                 phase = "withdraw"
+        if phase == "withdraw" and self._raid_phase != "withdraw" and target:
+            key = (int(target[0]) // 6, int(target[1]) // 6)
+            hits = [t for t in self._raid_hot.get(key, []) if now - t < 90]
+            hits.append(now)
+            self._raid_hot[key] = hits
+            if len(hits) >= 2:
+                self._problem(f"raids at {list(target)} keep getting driven off ({len(hits)}x): that ore is guarded; "
+                              f"raiding elsewhere for 90 s (give raid_x/raid_y to choose)")
         if phase == "withdraw":
             # Run for at least RAID_NOT_CHASED_S, then stop once nobody chases.
             started = self._raid_phase_since if self._raid_phase == "withdraw" else now
@@ -2189,13 +2220,19 @@ class RedAlertBot:
             orders.append({"cmd": "attack_move", "units": ids, "to": list(target), "queued": True})
         return orders
 
+    def _raid_hot_now(self, cell) -> bool:
+        key = (int(cell[0]) // 6, int(cell[1]) // 6)
+        now = time.monotonic()
+        return sum(1 for t in self._raid_hot.get(key, []) if now - t < 90) >= 2
+
     def _raid_cell(self, enemy_base) -> tuple[int, int] | None:
-        """Where enemy harvesters are, outside the reach of their defenses: one
-        seen recently, else the part of the ore field by their base that no
-        known defense covers. None when every option is covered."""
+        """Where enemy harvesters are, outside the reach of their defenses and
+        not somewhere the squad keeps getting driven off: one seen recently,
+        else the part of the ore field by their base that no known defense
+        covers. None when every option is covered or hot."""
         now = time.monotonic()
         recent = [c for c, t in self._enemy_harv_seen.values()
-                  if now - t < 45 and not self._covered_by_defense(c)]
+                  if now - t < 45 and not self._covered_by_defense(c) and not self._raid_hot_now(c)]
         if recent:
             return recent[-1]
         if self._raid_target and not self._covered_by_defense(self._raid_target):
@@ -2203,7 +2240,7 @@ class RedAlertBot:
         if not enemy_base:
             return None
         cells = _ore_cells_near(self._config, enemy_base) or [enemy_base]
-        safe = [c for c in cells if not self._covered_by_defense(c)]
+        safe = [c for c in cells if not self._covered_by_defense(c) and not self._raid_hot_now(c)]
         if not safe:
             if not self._recent("raid_covered_note", 20.0):
                 self._mark("raid_covered_note")

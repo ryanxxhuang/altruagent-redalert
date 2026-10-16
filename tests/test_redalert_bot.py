@@ -347,12 +347,12 @@ def test_group_waits_for_stragglers_and_holds_when_outnumbered_ahead(monkeypatch
     obs = _obs(buildings=[{"id": 1, "type": "fact", "x": 20, "y": 20}], units=front, visible_enemies=foes)
     orders = _orders(b2.choose_action(_state(obs), CTX))
     assert all(o["to"] == [50, 50] for o in orders if o["cmd"] == "attack_move")
-    # Already in contact with it: never stand still at our own centre.
+    # Already in contact with a stronger force: hold, never push on into it.
     foes = [{"id": 900 + i, "type": "4tnk", "x": 56, "y": 56, "hp": 100} for i in range(8)]
     b2._sent.clear()
     obs = _obs(buildings=[{"id": 1, "type": "fact", "x": 20, "y": 20}], units=front, visible_enemies=foes)
     orders = _orders(b2.choose_action(_state(obs), CTX))
-    assert not any(o["cmd"] == "attack_move" and o["to"] == [50, 50] for o in orders)
+    assert not any(o["cmd"] == "attack_move" and o["to"][0] > 51 for o in orders)
 
 
 def test_strategy_build_targets_and_avoid_are_obeyed():
@@ -494,13 +494,13 @@ def test_holding_is_reported_not_overridden():
     assert not b._attacking and b.status()["main_idle_seconds"] >= 41  # the LLM decides, with the facts
 
 
-def test_commander_attack_advances_into_a_stronger_force_and_reports_it():
+def test_commander_attack_into_a_stronger_force_holds_and_reports_it():
     front = [{"id": 100 + i, "type": "3tnk", "x": 50, "y": 50, "idle": True, "hp": 100} for i in range(6)]
     foes = [{"id": 900 + i, "type": "4tnk", "x": 57, "y": 57, "hp": 100} for i in range(5)]
     b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 80}))
     orders = _orders(b.choose_action(_state(_base_obs(units=front, visible_enemies=foes)), CTX))
-    assert any(o["cmd"] == "attack_move" and o["to"][0] > 50 for o in orders)  # obeys
-    assert b.status()["strength_ahead"] > 0  # and tells the commander what is there
+    assert not any(o["cmd"] == "attack_move" and o["to"][0] > 52 for o in orders)  # does not push in
+    assert b.status()["strength_ahead"] > 0 and "outnumbered" in b.status()["main_state"]
 
 
 def test_build_named_while_in_production_is_that_one_not_another():
@@ -1029,3 +1029,38 @@ def test_no_surrounding_under_an_enemy_defense():
     b._enemy_buildings = {950: {"id": 950, "type": "tsla", "x": 59, "y": 50}}
     b.choose_action(_state(_base_obs(units=army, visible_enemies=foes)), CTX)
     assert "under their tsla" in b.status()["main_state"]
+
+
+def test_in_contact_the_army_holds_unless_it_has_the_edge():
+    army = [{"id": 100 + i, "type": "3tnk", "x": 50, "y": 50, "idle": False, "hp": 100} for i in range(6)]   # 6,900
+    foes = [{"id": 900 + i, "type": "3tnk", "x": 58, "y": 50, "hp": 100} for i in range(6)]                   # 6,900 in contact
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 50}))
+    b.rules = {"3tnk": {"cost": 1150, "speed": 1.56}}
+    b.choose_action(_state(_base_obs(units=army, visible_enemies=foes)), CTX)
+    assert "holding at the edge" in b.status()["main_state"] or "holding ground" in b.status()["main_state"]
+
+
+def test_pincer_does_not_restart_when_the_auto_target_drifts():
+    army = [{"id": 100 + i, "type": "3tnk", "x": 30, "y": 50, "idle": True, "hp": 100} for i in range(5)]
+    army += [{"id": 200 + i, "type": "1tnk", "x": 30, "y": 50, "idle": True, "hp": 100} for i in range(3)]
+    army += [{"id": 300 + i, "type": "jeep", "x": 27, "y": 27, "idle": True, "hp": 100} for i in range(2)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "pincer"}))  # auto target
+    b.rules = {"3tnk": {"cost": 1150, "speed": 1.56}, "1tnk": {"cost": 700, "speed": 2.76}, "jeep": {"cost": 500, "speed": 4.0}}
+    import time as _t
+    b._enemy_army = {900 + i: {"type": "2tnk", "hp": 100, "x": 60, "y": 50, "t": _t.monotonic()} for i in range(3)}
+    b._enemy_army_seen_at = _t.monotonic()
+    b.choose_action(_state(_base_obs(units=army)), CTX)
+    first = b._pincer["since"]
+    b._enemy_army = {900 + i: {"type": "2tnk", "hp": 100, "x": 72, "y": 58, "t": _t.monotonic()} for i in range(3)}  # moved 14 cells
+    b._sent.clear()
+    b.choose_action(_state(_base_obs(units=army)), CTX)
+    assert b._pincer["since"] == first and b._pincer["target"] == (72, 58)
+
+
+def test_raid_avoids_a_target_it_keeps_getting_driven_off():
+    import time as _t
+    b = bot()
+    b._raid_hot = {(74 // 6, 73 // 6): [_t.monotonic(), _t.monotonic()]}
+    b._config = {"rules": {"maps": {"m": {"spawns": [[80, 80]], "layout": {
+        "origin": [0, 0], "rows": ["." * 100] * 72 + ["." * 72 + "$$$$" + "." * 24] * 3 + ["." * 100] * 25}}}}}
+    assert b._raid_cell((80, 80)) is None  # the only patch is hot: no raid there for now
