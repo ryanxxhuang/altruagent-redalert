@@ -1619,3 +1619,48 @@ def test_an_outnumbered_advance_party_falls_back_on_the_army_instead_of_a_whole_
     back = [o for o in orders if o["cmd"] == "move" and set(o["units"]) == set(range(100, 107))]
     assert back and back[-1]["to"][0] < 60  # the party falls back towards the main body
     assert not any(o["cmd"] == "move" and set(o["units"]) & set(range(200, 240)) for o in orders)
+
+
+def test_raid_squads_take_fast_vehicles_never_dogs():
+    dogs = [{"id": 100 + i, "type": "dog", "x": 30, "y": 30, "idle": True, "hp": 100} for i in range(3)]
+    jeeps = [{"id": 150 + i, "type": "jeep", "x": 30, "y": 30, "idle": True, "hp": 100} for i in range(2)]
+    tanks = [{"id": 200 + i, "type": "3tnk", "x": 30, "y": 30, "idle": True, "hp": 100} for i in range(5)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 2, "raid_x": 60, "raid_y": 20}))
+    b.rules = {"dog": {"cost": 200, "speed": 2.44}, "jeep": {"cost": 500, "speed": 4.0}, "3tnk": {"cost": 1150, "speed": 1.56}}
+    b.choose_action(_state(_base_obs(units=dogs + jeeps + tanks)), CTX)
+    assert b._raiders == {150, 151}
+    b2 = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 2, "raid_x": 60, "raid_y": 20}))
+    b2.rules = b.rules
+    b2.choose_action(_state(_base_obs(units=dogs + tanks)), CTX)
+    assert not b2._raiders and any("no fast units" in p for p in b2.status()["problems"])
+
+
+def test_demolition_truck_rams_the_priciest_known_building_alone():
+    truck = [{"id": 100, "type": "dtrk", "x": 30, "y": 30, "idle": True, "hp": 100}]
+    tanks = [{"id": 200 + i, "type": "3tnk", "x": 30, "y": 30, "idle": True, "hp": 100} for i in range(5)]
+    theirs = [{"id": 900, "type": "powr", "x": 70, "y": 70}, {"id": 901, "type": "weap", "x": 74, "y": 72}]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 70, "main_y": 70}))
+    b.rules = {"dtrk": {"cost": 2500, "speed": 1.64}, "3tnk": {"cost": 1150, "speed": 1.56}, "weap": {"cost": 2000}, "powr": {"cost": 300}}
+    orders = _orders(b.choose_action(_state(_base_obs(units=truck + tanks, visible_enemy_buildings=theirs)), CTX))
+    ram = [o for o in orders if o["cmd"] == "attack" and o["units"] == [100]]
+    assert ram and ram[-1]["target"] == 901  # the war factory, not the power plant
+    assert not any(o["cmd"] == "attack_move" and 100 in o["units"] for o in orders)  # never with the army
+
+
+def test_opponent_model_counts_aircraft_and_advises_anti_air():
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({}))
+    foes = [{"id": 900 + i, "type": "yak", "x": 60, "y": 60, "hp": 100} for i in range(2)]
+    b.choose_action(_state(_base_obs(visible_enemies=foes)), CTX)
+    om = b.opponent_model()
+    assert om["aircraft"] == 2 and any("fly aircraft" in a for a in om["advice"])
+    assert "2 aircraft" in b._situation()
+
+
+def test_tech_ladder_names_the_specials_once_the_tech_centre_stands():
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({}))
+    obs = _base_obs()
+    obs["buildings"] += [{"id": 7, "type": "fix", "x": 30, "y": 20}, {"id": 8, "type": "dome", "x": 32, "y": 20},
+                         {"id": 9, "type": "stek", "x": 34, "y": 20}]
+    obs["available_production"] += ["4tnk", "v2rl", "apwr"]
+    b.choose_action(_state(obs), CTX)
+    assert "next: high-tech units: 4tnk, v2rl, apwr" in b._situation()

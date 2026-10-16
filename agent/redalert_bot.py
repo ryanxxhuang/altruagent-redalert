@@ -36,6 +36,9 @@ NON_COMBAT = frozenset(
     {"mcv", "harv", "e6", "medi", "mech", "spy", "thf", "truk", "mnly", "lst", "tran", "badr", "u2", "hijacker"}
 )
 SHIPS = frozenset({"ss", "msub", "dd", "ca", "pt", "lst"})
+INFANTRY_TYPES = frozenset({"e1", "e2", "e3", "e4", "e6", "e7", "medi", "mech", "dog", "shok", "spy", "thf", "zombie", "ant"})
+SUICIDE_TYPES = frozenset({"dtrk"})  # rides alone at a building; a dead one blows up its own neighbours
+HIGH_TECH = ("4tnk", "v2rl", "ttnk", "shok", "dtrk", "arty", "ctnk", "stnk", "e7", "tsla", "apwr", "dog")
 AIRCRAFT = frozenset({"heli", "hind", "mh60", "yak", "mig", "tran", "badr", "u2"})
 BARRACKS = ("tent", "barr")
 POWER = ("apwr", "powr")
@@ -635,12 +638,15 @@ class RedAlertBot:
         if tech_centre:
             done.append(tech_centre)
         missing = [k for k, n in ladder[:4] if have[k] < n]
-        nxt = missing[0] if missing else ("tech centre (stek/atek)" if not tech_centre else "high-tech units")
+        specials = [i for i in HIGH_TECH if i in getattr(self, "_catalog", {})]
+        nxt = missing[0] if missing else ("tech centre (stek/atek), then the faction's weapons" if not tech_centre else
+                                          "high-tech units" + (f": {', '.join(specials)}" if specials else ""))
         tech = f"; tech: {', '.join(done) or 'nothing yet'}; next: {nxt}"
         raiding = f" (raid squad out: tech window)" if self._raid_info.get("phase") in ("approach", "strike") else ""
         group += tech + raiding + self._trade_line()
         om = self.opponent_model()
         group += (f"; OPPONENT now: {om['tanks']} tanks, {om['infantry']} infantry, {om['siege']} siege, "
+                  + (f"{om['aircraft']} aircraft, " if om.get("aircraft") else "") +
                   f"{om['defenses']} defenses, tech {','.join(om['tech_seen']) or '?'}"
                   + (f", habits {','.join(om['habits'])}" if om["habits"] else "")
                   + (f". {' | '.join(om['advice'])}" if om["advice"] else ""))
@@ -1042,7 +1048,7 @@ class RedAlertBot:
             if apc_mode:
                 fast_owned = sum(1 for u in army if str(u.get("type", "")).lower() == "apc") + queued["apc"]
             else:
-                fast_owned = sum(1 for u in army if self._speed(u) >= RAID_FAST) + sum(
+                fast_owned = sum(1 for u in army if self._raid_capable(u)) + sum(
                     queued[v] for v in RAID_VEHICLES)
             paused = time.monotonic() < self._raid_paused_until and not LLM_AUTHORITY
             if fast_owned < (1 if apc_mode else d["raid_size"]) and self._raid_built < RAID_BUILD_CAP and not paused:
@@ -1177,6 +1183,11 @@ class RedAlertBot:
         return orders
 
     # -- army ------------------------------------------------------------------------------
+
+    def _raid_capable(self, unit: dict) -> bool:
+        """Fast enough to hit and run, and a vehicle: dogs are fast but bite only infantry."""
+        t = str(unit.get("type", "")).lower()
+        return self._speed(unit) >= RAID_FAST and t not in INFANTRY_TYPES and t not in SUICIDE_TYPES
 
     def _is_combat(self, unit: dict) -> bool:
         t = str(unit.get("type", "")).lower()
@@ -1436,6 +1447,7 @@ class RedAlertBot:
         their_tanks = sum(n for t, n in recent.items() if t in TANK_TYPES)
         their_siege = sum(n for t, n in recent.items() if t in SIEGE_TYPES)
         their_inf = sum(n for t, n in recent.items() if t in ("e1", "e2", "e3", "e4", "shok", "e7"))
+        their_air = sum(n for t, n in recent.items() if t in AIRCRAFT)
         tech = sorted({str(b.get("type", "")).lower() for b in self._enemy_buildings.values()
                        if str(b.get("type", "")).lower() in TECH_BUILDINGS})
         our = getattr(self, "_our_types", Counter())
@@ -1451,9 +1463,12 @@ class RedAlertBot:
                           f"flak trucks (Soviet) or pillboxes shred them; e3 is fodder against riflemen")
         if self._opp_tags.get("turtle"):
             advice.append("turtling: don't attack the towers, raid the ore and bring siege")
+        if their_air:
+            advice.append(f"they fly aircraft ({their_air} seen): flak trucks / e3 with the army and ore, sam/agun at the base; "
+                          f"tanks cannot shoot up")
         return {
             "recent_units": dict(recent), "ever_seen_units": dict(ever),
-            "tanks": their_tanks, "siege": their_siege, "infantry": their_inf,
+            "tanks": their_tanks, "siege": their_siege, "infantry": their_inf, "aircraft": their_air,
             "tech_seen": tech, "defenses": len(self.enemy_defenses()),
             "habits": sorted(k for k, v in self._opp_tags.items() if v),
             "our_tanks": our_tanks, "our_e3": our_e3,
@@ -1687,6 +1702,9 @@ class RedAlertBot:
         self._retreat_issued = False
         self._party_back: list[dict] = []
         alive = {u["id"]: u for u in army if isinstance(u.get("id"), int) and _xy(u)}
+        trucks = [u for u in alive.values() if str(u.get("type", "")).lower() in SUICIDE_TYPES]
+        truck_ids = {u["id"] for u in trucks}
+        self._truck_orders = self._demo_trucks(trucks, staging)
         self._our_strength = sum(self._strength(u) for u in alive.values())
 
         def cell(x: int, y: int, default):
@@ -1744,9 +1762,9 @@ class RedAlertBot:
         apc_mode = str(d.get("raid_unit") or "").lower() == "apc"
         size = 0 if apc_mode else d["raid_size"]
         if size >= 2:
-            self._raiders = {i for i in self._raiders if self._speed(alive[i]) >= RAID_FAST}
+            self._raiders = {i for i in self._raiders if self._raid_capable(alive[i])}
         standing = int(self.knobs.get("standing_raid", 0) or 0)
-        fast_free = sum(1 for i, u in alive.items() if self._speed(u) >= RAID_FAST and i not in self._apc_ids())
+        fast_free = sum(1 for i, u in alive.items() if self._raid_capable(u) and i not in self._apc_ids())
         floor = min(RAID_FLOOR, fast_free) if fast_free >= RAID_FLOOR else 0
         if time.monotonic() < self._raid_paused_until and not LLM_AUTHORITY:
             size = 0  # too many raiders lost lately: everyone stays home for a while
@@ -1774,13 +1792,13 @@ class RedAlertBot:
             want = str(d.get("raid_unit") or "").lower()
             scout = size == 1 and want in ("", "e1")
             if scout and time.monotonic() < self._scouting_stopped_until:
-                spare = [u for u in spare if self._speed(u) >= RAID_FAST]  # a vehicle may still scout
+                spare = [u for u in spare if self._raid_capable(u)]  # a vehicle may still scout
             if not scout:
                 # Raids are fast vehicles only: infantry can't run and dies.
                 if want and DEFAULT_SPEED.get(want, self._speed({"type": want})) < RAID_FAST:
                     self._problem(f"raid_unit {want} is too slow to hit and run; raids use jeep/ftrk/1tnk/apc")
                     want = ""
-                spare = [u for u in spare if self._speed(u) >= RAID_FAST]
+                spare = [u for u in spare if self._raid_capable(u)]
                 if not spare:
                     self._problem("no fast units for the raid squad yet; the bot is building raid vehicles")
             if want:
@@ -1806,7 +1824,7 @@ class RedAlertBot:
             self._raid_info = {}
         orders += self._apc_raid(d, alive, enemies, rtarget, staging, raw)
 
-        main = [u for i, u in alive.items() if i not in self._raiders and i not in self._apc_ids()]
+        main = [u for i, u in alive.items() if i not in self._raiders and i not in self._apc_ids() and i not in truck_ids]
         self._idle_combat = sum(1 for u in main if u.get("idle"))
         self._main_centre = self._centroid([_xy(u) for u in main]) if main else None
         # Reflex: enemies at our base are fought by whoever is home.
@@ -1978,8 +1996,29 @@ class RedAlertBot:
                     continue
                 order = {**order, "units": ids}
             kept.append(order)
-        # The advance party's fall-back goes last: it beats micro's focus fire for those units.
-        return kept + micro + self._party_back
+        # The advance party's fall-back and the demo trucks' orders go last: they beat micro for those units.
+        return kept + micro + self._party_back + getattr(self, "_truck_orders", [])
+
+    def _demo_trucks(self, trucks: list[dict], staging) -> list[dict]:
+        """Demolition trucks (Ukraine) ride ALONE at the priciest known enemy
+        building; never with the army, since a dead one takes its neighbours."""
+        if not trucks:
+            return []
+        targets = [b for b in self._enemy_buildings.values() if _xy(b) and isinstance(b.get("id"), int)]
+        if not targets:
+            if not self._recent("dtrk_wait", 10.0):
+                self._mark("dtrk_wait")
+                self._problem("demolition truck idle: no enemy building is known; scout their base and it rams the priciest one")
+            far = [u["id"] for u in trucks if staging and _dist(_xy(u), staging) > 6]
+            return [{"cmd": "move", "units": far, "to": list(staging)}] if far else []
+        best = max(targets, key=lambda b: self._cost(str(b.get("type", "")).lower()))
+        if self._recent("dtrk", 3.0):
+            return []
+        self._mark("dtrk")
+        if not self._recent("dtrk_log", 30.0):
+            self._mark("dtrk_log")
+            self.log(f"[bot] demolition truck x{len(trucks)}: ramming their {best.get('type')} at {list(_xy(best))}")
+        return [{"cmd": "attack", "units": [u["id"] for u in trucks], "target": best["id"]}]
 
     def _under_cover(self, cell) -> bool:
         """Inside the reach (plus TOWER_LEASH) of one of our own defenses."""
