@@ -1312,3 +1312,19 @@ def test_raid_striking_empty_ground_twice_goes_home_and_lists_candidates():
     assert b._raid_home_until > _t.monotonic() and any("found nothing twice" in p for p in b.status()["problems"])
     cands = b.status()["raid_candidates"]
     assert isinstance(cands, list)
+
+
+def test_no_many_vs_few_chase_into_their_base_through_the_fog():
+    import time as _t
+    army = [{"id": 100 + i, "type": "3tnk", "x": 60, "y": 60, "idle": False, "hp": 100} for i in range(8)]  # 9,200
+    one = [{"id": 900, "type": "3tnk", "x": 66, "y": 62, "hp": 100}]  # one tank in view, by their base
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 80}))
+    b.rules = {"3tnk": {"cost": 1150, "speed": 1.56}, "tsla": {"cost": 1200}}
+    b._enemy_base_cache = (72, 70)
+    now = _t.monotonic()
+    b._enemy_army = {900 + i: {"type": "3tnk", "hp": 100, "x": 74, "y": 72, "t": now} for i in range(7)}  # 8,050 known
+    b._enemy_army_seen_at = now
+    b._enemy_buildings = {950: {"id": 950, "type": "tsla", "x": 70, "y": 68}}
+    b.choose_action(_state(_base_obs(units=army, visible_enemies=one)), CTX)
+    assert "surround" not in b.status()["main_state"]
+    assert any("no chasing into their base" in p for p in b.status()["problems"])

@@ -176,6 +176,8 @@ CRUSHED = 0.4               # reflex: the main army retreats when this much weak
 SURROUND_RATIO = 1.5
 HARASS_RATIO = 0.8
 SURROUND_RADIUS = 4         # ring around their group the surrounding units close onto
+ENEMY_BASE_RADIUS = 22      # inside this of their base, fog hides their army: no local "many vs few"
+CHASE_STEP = 8              # a surround never moves units further than this from the army's centre
 DOCTRINE_MIN = 300          # smaller enemy forces are shot on the move, not surrounded
 HARASS_STEP = 6             # cells the group backs off while they come on
 RAID_STRIKE_MAX_S = 20.0    # an unopposed raid keeps hitting a target this long to finish it
@@ -1866,6 +1868,20 @@ class RedAlertBot:
         ratio = ours_s / theirs_s
         ec = self._centroid([_xy(e) for e in near])
         cover = self._covered_by_defense(ec, margin=SURROUND_RADIUS + 1)
+        # Near their base what we see is not what is there: "many vs few" must
+        # hold against their whole known army plus defenses, not the few in view.
+        eb = getattr(self, "_enemy_base_cache", None)
+        near_their_base = bool(eb) and _dist(ec, eb) <= ENEMY_BASE_RADIUS
+        if near_their_base and ratio >= SURROUND_RATIO:
+            theirs_known, _ = self.enemy_army_estimate()
+            defs_s = sum(self._strength(b) for b in self.enemy_defenses() if self._defense_reach(b) > 0)
+            total_ours = sum(self._strength(u) for u in body)
+            if total_ours < AHEAD_EDGE * max(theirs_known + defs_s, theirs_s):
+                ratio = min(ratio, 1.0)  # not a many-vs-few: fog and towers make up the difference
+                if not self._recent("fog_note", 20.0):
+                    self._mark("fog_note")
+                    self._problem(f"{len(near)} enemy units in view near their base, but their known army + towers is "
+                                  f"{theirs_known + defs_s:.0f} vs our {total_ours:.0f}: no chasing into their base")
         if ratio >= SURROUND_RATIO and cover is not None:
             # Their group sits under a defense: no ring under fire. Hold at the
             # edge of its reach and shoot what comes out; siege deals with the tower.
@@ -1891,6 +1907,9 @@ class RedAlertBot:
                 ang = round(ang / (math.pi / 4)) * (math.pi / 4)  # 8 sides
                 slot = self._clamp((int(round(ec[0] + math.cos(ang) * SURROUND_RADIUS)),
                                     int(round(ec[1] + math.sin(ang) * SURROUND_RADIUS))), raw)
+                if _dist(slot, centre) > CHASE_STEP:
+                    # No deep chase: step towards the slot, never run off into the fog.
+                    slot = self._toward(centre, slot, CHASE_STEP, raw)
                 slots.setdefault(slot, []).append(u["id"])
             for slot, ids in slots.items():
                 orders.append({"cmd": "attack_move", "units": ids[:50], "to": list(slot)})
