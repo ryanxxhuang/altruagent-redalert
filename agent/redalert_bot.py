@@ -107,6 +107,8 @@ RAID_HOT_S = 120.0          # a target the squad was driven off is avoided this 
 RAID_EMPTY_S = 60.0         # a target where the squad found nothing is skipped this long
 RAID_EMPTY_STRIKE_S = 1.5   # a strike with nothing in reach ends this fast
 RAID_HOME_S = 45.0          # two empty strikes in a row: the squad waits at home this long
+SCOUT_LOSS_WINDOW_S = 180.0 # losing SCOUT_LOSS_MAX scouts within this ...
+SCOUT_LOSS_MAX = 2          # ... stops scouting (and the commander is told)
 RAID_HOT_CELL = 10          # ... as a block this many cells across
 RAID_BUILDING_PRIORITY = {"powr": 0, "apwr": 0, "proc": 1, "silo": 2, "weap": 3, "barr": 3, "tent": 3, "dome": 4,
                           "fix": 4, "stek": 5, "atek": 5}
@@ -313,6 +315,8 @@ class RedAlertBot:
         self._raid_empty: dict[tuple[int, int], float] = {}    # target -> when the squad found nothing there
         self._raid_empty_streak = 0
         self._raid_home_until = 0.0
+        self._scout_losses: list[float] = []
+        self._scouting_stopped_until = 0.0
         self._raid_built = 0                      # raid vehicles the bot has queued itself
         self._raid_losses: list[float] = []       # when a raider died on a raid
         self._raid_paused_until = 0.0
@@ -1625,6 +1629,13 @@ class RedAlertBot:
         # The raid squad's phase comes first: micro leaves a withdrawing squad alone.
         now_t = time.monotonic()
         lost = [i for i in self._raiders if i not in alive]
+        if lost and len(self._raiders) == 1 and self._raid_info.get("slow_units", 0) == 1:
+            self._scout_losses = [t for t in self._scout_losses if now_t - t < SCOUT_LOSS_WINDOW_S] + [now_t]
+            if len(self._scout_losses) >= SCOUT_LOSS_MAX:
+                self._scouting_stopped_until = now_t + SCOUT_LOSS_WINDOW_S
+                self._problem(f"scout killed {len(self._scout_losses)}x near {self._raid_info.get('at')}: their side is "
+                              f"guarded; no more infantry scouts for {SCOUT_LOSS_WINDOW_S:.0f}s. Use a jeep/flak truck, or stop")
+                self.log("[bot] scouting stopped: too many scouts lost")
         if lost and self._raid_phase in ("approach", "strike", "withdraw"):
             self._raid_losses += [now_t] * len(lost)
             self._raid_losses = [t for t in self._raid_losses if now_t - t < RAID_LOSS_WINDOW_S]
@@ -1696,6 +1707,8 @@ class RedAlertBot:
             spare = [u for i, u in alive.items() if i not in self._raiders and free(u)]
             want = str(d.get("raid_unit") or "").lower()
             scout = size == 1 and want in ("", "e1")
+            if scout and time.monotonic() < self._scouting_stopped_until:
+                spare = [u for u in spare if self._speed(u) >= RAID_FAST]  # a vehicle may still scout
             if not scout:
                 # Raids are fast vehicles only: infantry can't run and dies.
                 if want and DEFAULT_SPEED.get(want, self._speed({"type": want})) < RAID_FAST:
@@ -2385,8 +2398,14 @@ class RedAlertBot:
             self._raid_last_chased = now
         phase = self._raid_phase
         under_fire = any(str(e.get("type", "")).lower() in DEFENSE_RANGE for e in near_foes)
-        # Any responder at all ends the visit: the squad's job is to stay alive.
-        threatened = responders > 0 or under_fire
+        on_foot = all(self._speed(u) < RAID_FAST for u in squad)
+        if on_foot:
+            # A scout can't outrun anyone: it fights what it can beat and runs
+            # only from something stronger (a rifleman that runs just dies).
+            threatened = responders > 1.2 * squad_s or under_fire
+        else:
+            # Any responder at all ends the visit: the vehicles' job is to stay alive.
+            threatened = responders > 0 or under_fire
         if phase == "approach":
             if self._raid_hp_start <= 0 or hp > self._raid_hp_start:
                 self._raid_hp_start = hp
@@ -2470,6 +2489,15 @@ class RedAlertBot:
             return []
         phase = self._raid_phase
         orders: list[dict] = []
+        on_foot = all(self._speed(u) < RAID_FAST for u in squad)
+        if on_foot and near_foes and responders <= 1.2 * squad_s and phase in ("approach", "strike"):
+            # A scout facing something it can beat shoots it instead of walking on.
+            if not self._recent("raid_shot", 1.5):
+                foe = min(near_foes, key=lambda e: _dist(_xy(e), centre))
+                if isinstance(foe.get("id"), int):
+                    orders.append({"cmd": "attack", "units": ids, "target": foe["id"]})
+                    self._mark("raid_shot")
+            return orders
         if phase == "approach":
             if not self._recent("raid", 4.0):
                 orders += self._raid_orders(ids, squad, target, raw)

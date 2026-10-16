@@ -1349,3 +1349,32 @@ def test_economy_floor_harvesters_and_refineries_first():
     b._sent.clear()
     orders = _orders(b.choose_action(st, CTX))
     assert {"cmd": "build", "item": "proc"} in orders                           # the 3rd refinery after 5:00
+
+
+def test_scout_fights_an_equal_rifleman_and_runs_from_tanks():
+    scout = [{"id": 100, "type": "e1", "x": 60, "y": 60, "idle": True, "hp": 100}]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 1, "raid_unit": "e1", "raid_x": 80, "raid_y": 60}))
+    b.rules = {"e1": {"cost": 100, "speed": 1.32}, "3tnk": {"cost": 1150, "speed": 1.56}}
+    b.choose_action(_state(_base_obs(units=scout)), CTX)
+    assert b._raiders == {100} and b._raid_phase == "approach"
+    rifle = [{"id": 900, "type": "e1", "x": 64, "y": 60, "hp": 100}]
+    b._sent.clear()
+    orders = _orders(b.choose_action(_state(_base_obs(units=scout, visible_enemies=rifle)), CTX))
+    assert b._raid_phase == "approach"  # an equal: no running
+    assert any(o["cmd"] == "attack" and o["target"] == 900 and o["units"] == [100] for o in orders)
+    tank = [{"id": 901, "type": "3tnk", "x": 64, "y": 60, "hp": 100}]
+    b._sent.clear()
+    b.choose_action(_state(_base_obs(units=scout, visible_enemies=tank)), CTX)
+    assert b._raid_phase == "withdraw"  # stronger: run
+
+
+def test_scouting_stops_after_two_dead_scouts():
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"raid_size": 1, "raid_unit": "e1", "raid_x": 80, "raid_y": 60}))
+    b.rules = {"e1": {"cost": 100, "speed": 1.32}}
+    for sid in (100, 101):
+        b._sent.clear(); b.choose_action(_state(_base_obs(units=[{"id": sid, "type": "e1", "x": 60, "y": 60, "idle": True, "hp": 100}])), CTX)
+        assert b._raiders == {sid}
+        b._sent.clear(); b.choose_action(_state(_base_obs(units=[])), CTX)  # the scout died, nobody to replace it yet
+    assert b._scouting_stopped_until > 0 and any("scout killed" in p for p in b.status()["problems"])
+    b._sent.clear(); b.choose_action(_state(_base_obs(units=[{"id": 300, "type": "e1", "x": 26, "y": 26, "idle": True, "hp": 100}])), CTX)
+    assert not b._raiders  # no third rifleman sent
