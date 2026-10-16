@@ -1471,3 +1471,58 @@ def test_commanded_hold_cell_stands_at_the_gate_but_the_default_stays_under_the_
     orders = _orders(b2.choose_action(_state(obs2), CTX))
     moves = _army_moves(orders, ids2)
     assert moves and all(b2._under_cover(tuple(o["to"])) for o in moves)  # rules mode: pulled under the tower
+
+
+def _scored(kills, deaths, remaining, units=()):
+    obs = _base_obs(units=units)
+    obs["military"] = {"kills_cost": kills, "deaths_cost": deaths}
+    st = _state(obs, remaining=remaining)
+    st.raw["time"]["game_seconds"] = 1200 - remaining
+    return st
+
+
+def test_situation_leads_with_the_scoreboard_and_the_clock_rule():
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({}))
+    b.choose_action(_scored(16200, 8600, 565), CTX)
+    sit = b._situation()
+    assert sit.startswith("SCORE +7600 (kills 16200 - deaths 8600), 9:25 left: the clock gives us the WIN")
+    assert "CLOCK RULE: ahead" in sit
+    b.choose_action(_scored(16200, 20000, 300), CTX)
+    assert "CLOCK RULE: behind" in b._situation() and "gives THEM the win" in b._situation()
+    b.choose_action(_scored(100, 0, 900), CTX)
+    assert "CLOCK RULE" not in b._situation()  # early: the score is shown, the rule is not pressed yet
+
+
+def test_unscouted_enemy_base_is_flagged_until_a_unit_looks_inside():
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({}))
+    b.choose_action(_state(_base_obs()), CTX)
+    assert "their base interior has NEVER been seen" in b._situation()
+    scout = [{"id": 100, "type": "jeep", "x": 75, "y": 78, "idle": True, "hp": 100}]  # their base is at [80, 80]
+    b.choose_action(_state(_base_obs(units=scout)), CTX)
+    assert "NEVER been seen" not in b._situation()
+
+
+def test_a_bleeding_attack_is_broken_off_within_ten_seconds():
+    army = [{"id": 100 + i, "type": "3tnk", "x": 50, "y": 50, "idle": False, "hp": 100} for i in range(8)]
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({"main_action": "attack", "main_x": 80, "main_y": 50}))
+    b.rules = {"3tnk": {"cost": 1150, "speed": 1.56}}
+    obs = _base_obs(units=army)
+    obs["military"] = {"kills_cost": 9000, "deaths_cost": 5000}
+    st = _state(obs); st.raw["time"]["game_seconds"] = 640
+    b.choose_action(st, CTX)
+    assert b._attacking
+    obs2 = _base_obs(units=army[:5])
+    obs2["military"] = {"kills_cost": 9400, "deaths_cost": 8200}  # three heavy tanks in 8 s for 400
+    st2 = _state(obs2); st2.raw["time"]["game_seconds"] = 648
+    b._sent.clear()
+    orders = _orders(b.choose_action(st2, CTX))
+    assert not b._attacking and "bleeding" in b.status()["main_state"]
+    assert any(o["cmd"] == "move" for o in orders)
+
+
+def test_opponent_advice_calls_an_infantry_swarm_with_a_few_tanks_infantry_heavy():
+    b = RedAlertBot(log=lambda m: None, advisor=FakeCommander({}))
+    foes = [{"id": 900 + i, "type": "e1", "x": 60, "y": 60 + i % 5, "hp": 100} for i in range(12)]
+    foes += [{"id": 950 + i, "type": "2tnk", "x": 62, "y": 60, "hp": 100} for i in range(2)]
+    b.choose_action(_state(_base_obs(visible_enemies=foes)), CTX)
+    assert any("infantry-heavy (12 infantry vs 2 tanks)" in a for a in b.opponent_model()["advice"])

@@ -139,6 +139,10 @@ TRADE_BREAK_LOSS = 1200     # deaths exceed kills by this much in the window ...
 TRADE_BREAK_RATIO = 2.0     # ... and deaths are this many times the kills: break off
 TRADE_COOLDOWN_S = 20.0     # no re-engaging this long after breaking off ...
 TRADE_COOLDOWN_MAX_S = 180.0  # ... doubling each time it happens again within 5 minutes, up to this
+TRADE_FAST_WINDOW_S = 10.0  # bleeding: losing TRADE_FAST_LOSS in this long (kills under half) breaks off at once
+TRADE_FAST_LOSS = 2500
+CLOCK_LATE_S = 600.0        # the clock rule is spelled out with this much time left
+BASE_SEEN_RANGE = 12        # one of our units this close to their base centre has seen its interior
 RAID_LOSS_WINDOW_S = 180.0  # losing RAID_LOSS_MAX raiders within this ...
 RAID_LOSS_MAX = 2
 RAID_PAUSE_S = 120.0        # ... pauses raids (and replacements) this long
@@ -348,6 +352,8 @@ class RedAlertBot:
         self._retreat_until = 0.0
         self._enemy_army: dict[int, dict] = {}   # enemy combat units seen recently
         self._enemy_army_seen_at = -1e9          # when we last saw any enemy combat unit
+        self._remaining_s: float | None = None   # seconds left on the match clock
+        self._their_base_seen_at: float | None = None  # game second one of our units last stood inside their base
         self._held_since: float | None = None
         self._decision: dict | None = None           # the field commander's latest decision
         self._consumed: set[tuple[int, str]] = set() # one-shot parts of decisions already done
@@ -547,6 +553,24 @@ class RedAlertBot:
         return (f"; TRADE kills {k:.0f} - deaths {d:.0f} = {sign(k - d)} (last 2 min {sign(k2 - d2)}, "
                 f"last 30 s {sign(k30 - d30)})")
 
+    def _scoreboard(self) -> str:
+        """The tiebreak as it stands and the clock: the first thing the commander reads."""
+        if not self._trade_hist:
+            return ""
+        _, k, d = self._trade_hist[-1]
+        left = self._remaining_s
+        clock = f"{int(left // 60)}:{int(left % 60):02d} left" if left is not None else "clock unknown"
+        standing = ("the clock gives us the WIN" if k > d else "the clock gives THEM the win" if k < d else "a tie on the clock")
+        line = f"SCORE {k - d:+.0f} (kills {k:.0f} - deaths {d:.0f}), {clock}: {standing} as things stand"
+        if left is not None and left <= CLOCK_LATE_S:
+            if k > d:
+                line += ("; CLOCK RULE: ahead with under 10 min, a push into their base is the only way to lose this: "
+                         "finish what is in the open, hold where our towers cover, raid their ore")
+            else:
+                line += ("; CLOCK RULE: behind with under 10 min, only kills count now: their harvesters, power and "
+                         "anything soft with everything, nothing sits at home")
+        return line + "; "
+
     def _situation(self) -> str:
         ours = getattr(self, "_our_strength", 0)
         theirs, known = self.enemy_army_estimate()
@@ -573,6 +597,11 @@ class RedAlertBot:
             near = min(defs, key=lambda b: _dist(_xy(b), mc)) if mc else defs[0]
             group += (f"; known enemy defenses: {len(defs)} ({ds:.0f}), nearest {near.get('type')} at {list(_xy(near))}"
                       + (f" {_dist(_xy(near), mc):.0f} cells from our main army" if mc else ""))
+        if self._their_base_seen_at is None:
+            group += ("; their base interior has NEVER been seen (no scout got in): 'known defenses' is a lower bound, "
+                      "assume towers at their gate")
+        elif self._game_s - self._their_base_seen_at > 120:
+            group += f"; their base interior last seen {self._game_s - self._their_base_seen_at:.0f}s ago"
         r = self._raid_info or {}
         if r.get("responders") and (r.get("responders_from_their_base") or 0) >= 20:
             group += (f"; PINCER WINDOW: {r['responders']} of theirs is chasing our raid "
@@ -615,7 +644,7 @@ class RedAlertBot:
                       f"army; the main army is {'OUTSIDE tower cover' if g['army_out'] else 'under the towers'}"
                       + ("; your orders stand, one out of cover gets a WARNING in problems" if not g["strict"]
                          else "; orders out of cover are refused"))
-        return (f"our army {ours:.0f} vs their known army {total:.0f} ({ratio}); at our base {self._threat:.0f}; "
+        return (self._scoreboard() + f"our army {ours:.0f} vs their known army {total:.0f} ({ratio}); at our base {self._threat:.0f}; "
                 f"main army: {self._main_state}{held}; ahead of it {getattr(self, '_ahead', 0):.0f}{group}")
 
     def _llm(self) -> dict | None:
@@ -699,6 +728,8 @@ class RedAlertBot:
 
         game_s = (raw.get("time") or {}).get("game_seconds")
         self._game_s = float(game_s) if isinstance(game_s, (int, float)) else self._game_s
+        rem = (raw.get("time") or {}).get("remaining_seconds")
+        self._remaining_s = float(rem) if isinstance(rem, (int, float)) else self._remaining_s
         mil = obs.get("military") or {}
         k_now, d_now = float(mil.get("kills_cost") or 0), float(mil.get("deaths_cost") or 0)
         self._trade_hist.append((self._game_s, k_now, d_now))
@@ -720,6 +751,8 @@ class RedAlertBot:
         self._remember_enemy_harvesters(enemies)
         self._track_enemies(enemies, units)
         self._tag_opponent(enemies, units)
+        if enemy_base and any(_xy(u) and _dist(_xy(u), enemy_base) <= BASE_SEEN_RANGE for u in units):
+            self._their_base_seen_at = self._game_s  # someone of ours is looking at their base interior
 
         orders: list[dict] = []
         notes: list[str] = []
@@ -1398,8 +1431,9 @@ class RedAlertBot:
             advice.append(f"they have {their_tanks} tanks, we have {our_tanks}: build tanks and {ANTI_TANK_INF} now, no tech until matched")
         if their_siege and not any(t in SIEGE_TYPES for t in our):
             advice.append("they have siege units: fast units (jeep/ftrk/1tnk) must hunt them; don't sit in a turret")
-        if their_inf >= 8 and their_tanks == 0:
-            advice.append("infantry-heavy: tanks crush them; flame towers / pillboxes trade well")
+        if their_inf >= 8 and their_inf >= 3 * max(their_tanks, 1):
+            advice.append(f"infantry-heavy ({their_inf} infantry vs {their_tanks} tanks): tanks crush them, flamers (e4) / "
+                          f"flak trucks (Soviet) or pillboxes shred them; e3 is fodder against riflemen")
         if self._opp_tags.get("turtle"):
             advice.append("turtling: don't attack the towers, raid the ore and bring siege")
         return {
@@ -1777,9 +1811,12 @@ class RedAlertBot:
         # broken off, whatever the strength estimate says (fog lies, kills don't).
         if action in ("attack", "pincer", "ambush") and self._attacking:
             k30, d30 = self.trade_window(TRADE_WINDOW_S)
-            if d30 - k30 >= TRADE_BREAK_LOSS and d30 >= TRADE_BREAK_RATIO * max(k30, 1.0) \
-                    and time.monotonic() >= self._trade_broken_until:
-                self._break_off(f"losing the trade (last 30 s: killed {k30:.0f}, lost {d30:.0f})")
+            k10, d10 = self.trade_window(TRADE_FAST_WINDOW_S)
+            losing = d30 - k30 >= TRADE_BREAK_LOSS and d30 >= TRADE_BREAK_RATIO * max(k30, 1.0)
+            bleeding = d10 >= TRADE_FAST_LOSS and d10 >= TRADE_BREAK_RATIO * max(k10, 1.0)
+            if (losing or bleeding) and time.monotonic() >= self._trade_broken_until:
+                self._break_off(f"bleeding (last 10 s: killed {k10:.0f}, lost {d10:.0f})" if bleeding else
+                                f"losing the trade (last 30 s: killed {k30:.0f}, lost {d30:.0f})")
                 centre = self._centroid([_xy(u) for u in force])
                 if centre and staging:
                     back = self._flee_cell(centre, [_xy(e) for e in enemies if _xy(e) and self._is_combat(e)] or [centre],
