@@ -5,16 +5,20 @@ never waits for a model. Above it, three layers run at different speeds:
 
 | Layer      | Default model        | Effort            | Every                     | Decides                                   |
 |------------|----------------------|-------------------|---------------------------|-------------------------------------------|
-| strategy   | ``claude-opus-5-5``   | medium            | 15 s                      | the game plan, build targets, what to avoid |
-| tactical   | ``claude-sonnet-5-5`` | low               | continuously (3 s apart)  | production and every army move (field commander) |
-| fast       | ``claude-haiku-5-5``  | low, thinking off | 3 s, only while fighting  | focus-fire target, pull back damaged units |
+| strategy   | ``claude-fable-5-1``  | high              | 20 s                      | the game plan, build targets, what to avoid |
+| tactical   | ``claude-fable-5-1``  | low               | 6 s                       | production and every army move (field commander) |
+| fast       | off (``FAST_MODEL``)  | low, thinking off | 3 s, only while fighting  | focus-fire target, pull back damaged units |
+
+Measured on the commander's real prompt (Oct 15): Fable low 2.7 s, Opus low
+2.3 s, Opus medium 4.9 s, Fable medium 11.6 s. Fable at low effort keeps the
+6 s cadence; medium would not.
 
 The bot keeps sub-second reflexes in code (kiting, focus fire, placing
 buildings, harvesting, home defense, emergency retreat) and falls back to its
 own rules when the field commander has been silent for 20 s.
 
 Each layer sees the layer above's latest instructions, so the plan flows
-down: Fable's plan → Opus's tactics → Sonnet's micro. A slow or failing
+down: the general's plan → the commander's tactics → the bot's reflexes. A slow or failing
 request only means that layer's instructions stay as they were.
 
 Configuration (``.env``): ``ANTHROPIC_API_KEY`` turns the layers on. Per layer
@@ -175,7 +179,7 @@ JSON only."""
 LAYERS = {
     # name: (model env, default model, effort env, default effort, every seconds, timeout seconds, max calls)
     "strategy": ("STRATEGY_MODEL", "claude-fable-5-1", "STRATEGY_EFFORT", "high", 20.0, 120.0, 120),
-    "tactical": ("TACTICAL_MODEL", "claude-opus-5-5", "TACTICAL_EFFORT", "low", 6.0, 40.0, 500),
+    "tactical": ("TACTICAL_MODEL", "claude-fable-5-1", "TACTICAL_EFFORT", "low", 6.0, 40.0, 500),
     "fast": ("FAST_MODEL", "off", "FAST_EFFORT", "low", 4.0, 15.0, 400),
 }
 FIGHT_RADIUS = 14  # the fast layer only runs while enemies are this close to our army

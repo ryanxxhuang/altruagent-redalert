@@ -1,6 +1,6 @@
-"""Our tournament agent: a Red Alert bot (``agent/redalert_bot.py``) with an
-three Claude command layers (``agent/advisor.py``: Fable strategy, Opus
-tactics, Sonnet micro; on when ``ANTHROPIC_API_KEY`` is in ``.env``).
+"""Our tournament agent: a Red Alert bot (``agent/redalert_bot.py``) with
+Claude command layers (``agent/advisor.py``: a Fable general every 20 s, a
+Fable field commander every 6 s; on when ``ANTHROPIC_API_KEY`` is in ``.env``).
 
     python -m agent --match        # test matches
     python -m agent --tournament   # tournament day

@@ -174,7 +174,7 @@ def test_layer_settings_and_handlers(monkeypatch):
     c = advisor.commanders_from_env(log=lambda m: None)
     layers = c._layers
     assert (layers["strategy"].model, layers["strategy"].effort) == ("claude-fable-5-1", "high")
-    assert (layers["tactical"].model, layers["tactical"].effort, layers["tactical"].every) == ("claude-opus-5-5", "low", 6.0)
+    assert (layers["tactical"].model, layers["tactical"].effort, layers["tactical"].every) == ("claude-fable-5-1", "low", 6.0)
     assert "fast" not in layers  # micro is the bot's own reflexes
     assert "thinking" not in layers["tactical"]._request_kwargs()
     assert layers["strategy"]._request_kwargs()["fallbacks"] == "default"
